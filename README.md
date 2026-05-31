@@ -50,6 +50,36 @@ final_score     = clamp(deepfake_score · (1 + 0.15 · rag_boost), 0.0, 1.0)
 - Kafka transport secured with SASL_SSL.
 - All secrets injected via environment variables; see `.env.example`.
 
+## Getting Started
+
+### Prerequisites
+- Docker & Docker Compose
+- Python 3.11+
+- Git
+
+### Quick Start
+```bash
+# 1. Clone and setup
+git clone <repository>
+cd ARDD_TP
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your secrets
+
+# 3. Prepare test dataset
+python prepare_test_dataset.py
+
+# 4. Start the stack
+docker compose up -d
+
+# 5. Verify services
+python test_infrastructure.py
+```
+
+### Build Phases
+Follow the step-by-step guide in [`PHASES.md`](./PLAN/PHASES.md) for incremental development.
+
 ## Docs
 
 | File | Description |
@@ -63,4 +93,6 @@ final_score     = clamp(deepfake_score · (1 + 0.15 · rag_boost), 0.0, 1.0)
 | [`ERROR_HANDLING.md`](./PLAN/ERROR_HANDLING.md) | All failure scenarios and responses |
 | [`SECURITY.md`](./PLAN/SECURITY.md) | Security specifications, threat model, secrets management |
 | [`TESTING.md`](./PLAN/TESTING.md) | Testing strategy, accuracy benchmarks, performance benchmarks |
+| [`PHASES.md`](./PLAN/PHASES.md) | Step-by-step build order with verification commands |
 | [`ROADMAP.md`](./PLAN/ROADMAP.md) | Current implementation vs. future phases |
+| [`NEXT_STEPS.md`](./NEXT_STEPS.md) | What to do after environment setup |

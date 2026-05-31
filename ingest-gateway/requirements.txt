@@ -1,0 +1,4 @@
+opencv-python==4.9.0.80
+kafka-python==2.0.2
+numpy==1.26.4
+requests==2.31.0
