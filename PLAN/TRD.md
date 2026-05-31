@@ -8,26 +8,90 @@
 | Component | Technology |
 |---|---|
 | Message Broker | Apache Kafka |
+| Ingest Gateway | Python (OpenCV, FFmpeg) |
 | Vision Service | PyTorch, FastAPI (EfficientNet + FFT dual-branch) |
 | RAG / Context Service | LangChain, FAISS/ChromaDB, Ollama/Mistral |
+| Aggregation Service | Python, FastAPI |
 | MLOps & Telemetry | MLflow |
 | Frontend | React, TypeScript, Zustand, WebSockets |
 | Infrastructure | Docker, Docker Compose |
 
+---
+
 ## 2. Performance & SLA
 
-- **Latency:** End-to-end processing per frame must not exceed 200ms.
+- **Latency:** End-to-end processing per frame must not exceed **200ms**.
 - **Throughput:** Must handle concurrent input from at least 3 Kafka topics.
 - **Uptime:** All microservices must implement automatic restart policies via Docker Compose.
 
+---
+
 ## 3. Module Specifications
 
+- **Ingest Gateway:** Decodes RTSP/HTTP video stream, extracts frames via OpenCV/FFmpeg, encodes as JPEG, publishes `FramePayload` to the Kafka `frames` topic.
 - **Kafka Consumer:** Reads binary payloads, decodes to OpenCV tensors, forwards to Vision Service.
-- **FastAPI Vision Node:** Exposes a POST endpoint; accepts tensors, runs MTCNN alignment, executes EfficientNet-FFT model.
-- **LangChain Auditor:** Retrieves metadata via semantic search; applies strict refusal-based guardrails for unidentifiable inputs.
+- **FastAPI Vision Node:** Exposes `POST /infer`; accepts tensors, runs MTCNN alignment, executes EfficientNet-FFT model, returns `VisionResult`.
+- **Aggregation Service:** Receives `VisionResult`, calls RAG Context Agent sequentially, merges results into `AggregatedResult`, emits to MLflow and WebSocket. RAG timeout budget: **150ms**.
+- **LangChain Auditor:** Retrieves metadata via semantic search using the vision score as query context; applies strict refusal-based guardrails for unidentifiable inputs.
 
-## 4. Conditional Branching & Future States
+---
 
-- **Face Alignment Failure:** If MTCNN fails to detect a face, Vision Service bypasses inference, logs an `unaligned_frame` flag to MLflow, and returns a neutral baseline score.
-- **Service Timeout:** If the RAG service exceeds 500ms, the final audit resolves using only the Vision Service score to maintain SLA compliance.
-- **Future State:** Transition from REST to gRPC for Kafka Consumer ↔ Vision Service communication to reduce serialization overhead.
+## 4. Scoring Algorithm
+
+### 4.1 Vision Score (EfficientNet + FFT dual-branch)
+
+The Vision Service produces a `deepfake_score ∈ [0.0, 1.0]` via a weighted combination of two branches:
+
+```
+deepfake_score = α · spatial_score + (1 - α) · frequency_score
+```
+
+- **`spatial_score`** — EfficientNet-B4 sigmoid output on the aligned face crop. Captures texture and identity inconsistencies.
+- **`frequency_score`** — FFT branch sigmoid output on the frequency-domain representation of the frame. Captures GAN-specific spectral artefacts.
+- **`α = 0.6`** (spatial branch weighted higher; tunable via MLflow experiment config).
+- If MTCNN alignment fails, `deepfake_score` is set to **0.5** (neutral baseline) and both branches are skipped.
+
+### 4.2 Final Combined Score (Aggregation Service)
+
+The Aggregation Service computes a `final_score` from the vision score and RAG confidence:
+
+```
+final_score = deepfake_score · (1 + β · rag_boost)
+final_score = clamp(final_score, 0.0, 1.0)
+```
+
+Where:
+- **`rag_boost`** — applied only when `audit_verdict == "FAIL"`: `β = 0.15`. Increases the score when RAG confirms a known threat signature.
+- **`rag_boost = 0`** when `audit_verdict == "PASS"`, `"UNKNOWN"`, or `rag_used == false`.
+
+### 4.3 Alert Threshold
+
+An `alert: true` flag is set on `AggregatedResult` when `final_score > 0.90` for **5 or more consecutive frames** on the same `stream_id`.
+
+### 4.4 Drift Detection
+
+MLflow computes a rolling average of `deepfake_score` over the last **100 frames** per stream. If the average drops below **0.60** on frames labelled as real (ground truth available), `drift_flag: true` is set and the model is flagged for retraining.
+
+---
+
+## 5. Failure Scenarios
+
+See `ERROR_HANDLING.md` for the full failure matrix.
+
+Key current-phase behaviours:
+- **Face alignment failure:** Vision bypasses inference, returns neutral score 0.5.
+- **RAG timeout (>150ms):** Aggregation resolves with Vision score only (`rag_used: false`).
+- **Vision Service unavailable:** Frame dropped, `pipeline_error` emitted to WebSocket.
+- **MLflow unavailable:** Telemetry buffered in memory (up to 100 entries), flushed on recovery.
+
+---
+
+## 6. Future States
+
+> Items below are **not** part of the v1.0.0 implementation. See `ROADMAP.md` for phasing.
+
+- **gRPC transport:** Replace REST between Kafka Consumer ↔ Vision Service to reduce serialization overhead (Phase 2).
+- **Horizontal Vision scaling:** Multiple Vision Service replicas behind a load balancer (Phase 2).
+- **ChromaDB persistent store:** Replace in-memory FAISS with persistent ChromaDB (Phase 2).
+- **Apache Flink aggregation:** Windowed stream processing and temporal analysis (Phase 3).
+- **Automated retraining pipeline:** Auto-trigger fine-tuning on drift detection (Phase 3).
