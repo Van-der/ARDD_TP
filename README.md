@@ -1,4 +1,5 @@
-# ARDD-TP(Autonomous Real-Time Deepfake Detection & Telemetry Pipeline)
+# ARDD-TP
+(Autonomous Real-Time Deepfake Detection & Telemetry Pipeline)
 
 Real-time video stream analysis pipeline with AI-powered deepfake detection, contextual verification, and live telemetry dashboard.
 
