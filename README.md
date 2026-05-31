@@ -31,7 +31,7 @@ Real-time video stream analysis pipeline with AI-powered deepfake detection, con
 
 ## Docs
 
-- [`FLOW.md`](./FLOW.md) — System flow and sequence diagrams
-- [`PRD.md`](./PRD.md) — Product requirements
-- [`TRD.md`](./TRD.md) — Technical requirements and module specs
-- [`SCHEMA.md`](./SCHEMA.md) — Message and event schema reference
+- [`FLOW.md`](./PLAN/FLOW.md) — System flow and sequence diagrams
+- [`PRD.md`](./PLAN/PRD.md) — Product requirements
+- [`TRD.md`](./PLAN/TRD.md) — Technical requirements and module specs
+- [`SCHEMA.md`](./PLAN/SCHEMA.md) — Message and event schema reference
