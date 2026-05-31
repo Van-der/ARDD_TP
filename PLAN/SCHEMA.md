@@ -104,11 +104,56 @@ Broadcast to the React dashboard from the `AggregatedResult`.
 
 ---
 
-## 7. Threat Signature Database
+## 7. Ground Truth Label
+
+Published to the Kafka `labels` topic by an operator or auto-labelling service. Used by the Aggregation Service to feed the MLflow drift monitor.
+
+```json
+{
+  "stream_id": "string",
+  "frame_index": "integer",
+  "label": "string (REAL | FAKE)",
+  "labelled_by": "string (OPERATOR | AUTO_LABEL_SERVICE)",
+  "timestamp_ms": "integer"
+}
+```
+
+> Only `label: "REAL"` frames are used for drift detection. See `TRD.md §4.4`.
+
+---
+
+## 8. Webhook Alert Payload
+
+POSTed by the Aggregation Service to `WEBHOOK_URL` when `alert: true` is set on an `AggregatedResult`.
+
+```json
+{
+  "event": "DEEPFAKE_ALERT",
+  "stream_id": "string",
+  "frame_index": "integer",
+  "final_score": "float (0.0–1.0)",
+  "audit_verdict": "string (PASS | FAIL | UNKNOWN)",
+  "matched_signature": "string | null",
+  "consecutive_alert_frames": "integer",
+  "timestamp_ms": "integer"
+}
+```
+
+**Headers sent with the request:**
+```
+Content-Type: application/json
+Authorization: Bearer <WEBHOOK_TOKEN>
+```
+
+> Delivery is retried up to 3 times with exponential backoff. Failed deliveries are logged as `webhook_delivery_failed` — see `ERROR_HANDLING.md §5`.
+
+---
+
+## 9. Threat Signature Database
 
 The RAG Context Agent queries a vector store (FAISS/ChromaDB) backed by a structured threat signature registry. Each signature represents a known synthetic identity or deepfake artefact pattern.
 
-### 7.1 Threat Signature Record
+### 9.1 Threat Signature Record
 
 Stored in ChromaDB / FAISS as a document with metadata. The `embedding` is generated from `description` + `artefact_tags` at index time.
 
@@ -126,7 +171,7 @@ Stored in ChromaDB / FAISS as a document with metadata. The `embedding` is gener
 }
 ```
 
-### 7.2 Signature Match Result
+### 9.2 Signature Match Result
 
 Returned by the vector store query before the LLM verdict step.
 
@@ -141,7 +186,7 @@ Returned by the vector store query before the LLM verdict step.
 
 > A match is considered relevant when `similarity_score >= 0.75`. Below this threshold the RAG agent treats the result as no match and returns `audit_verdict: "UNKNOWN"`.
 
-### 7.3 Artefact Tag Vocabulary
+### 9.3 Artefact Tag Vocabulary
 
 Standardised tags used in `artefact_tags` to enable consistent retrieval:
 

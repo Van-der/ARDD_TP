@@ -35,9 +35,9 @@ final_score     = clamp(deepfake_score · (1 + 0.15 · rag_boost), 0.0, 1.0)
 
 ## Resilience
 
-- **RAG Timeout:** Falls back to Vision score alone (`audit_verdict: "UNKNOWN"`) if RAG exceeds **150ms**, keeping end-to-end latency within the **200ms SLA**.
+- **RAG Timeout:** Falls back to Vision score alone (`audit_verdict: "UNKNOWN"`) if RAG exceeds **100ms**, keeping end-to-end latency within the **200ms SLA** (Vision ≤80ms + RAG ≤100ms + overhead ≤20ms).
 - **Face Alignment Failure:** Bypasses inference, returns neutral score `0.5`, logs `unaligned_frame` to MLflow.
-- **Model Drift:** Auto-flags for retraining when rolling confidence average drops below 60%.
+- **Model Drift:** Auto-flags for retraining when rolling confidence average drops below 60% on ground-truth-labelled real frames.
 - **WebSocket Disconnect:** Exponential backoff reconnection with stale-data indicator.
 - **MLflow Unavailable:** Buffers up to 100 telemetry entries in memory, flushes on recovery.
 - **Throughput Overload:** Dynamically downsamples from 30 FPS to 5 FPS.
