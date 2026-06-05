@@ -1,24 +1,9 @@
-# PLAN documentation (excluded as per user request)
-PLAN/SCHEMA.md
-PLAN/TRD.md
-PLAN/PRD.md
-PLAN/FLOW.md
-PLAN/ARCHITECTURE.md
-PLAN/API_SPEC.md
-PLAN/ERROR_HANDLING.md
-PLAN/ROADMAP.md
-PLAN/SECURITY.md
-PLAN/TESTING.md
-PLAN/PHASES.md
-
-# Generated next steps guide
-NEXT_STEPS.md
-
-# Environment variables
+# Environment variables (keep .env.example in repo)
 .env
-.env.*
-.env.example
-
+.env.local
+.env.*.local
+.env.*                                                                  
+.env.example 
 # Test dataset
 test_dataset/
 
