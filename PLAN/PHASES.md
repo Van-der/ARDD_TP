@@ -2,7 +2,7 @@
 
 A step-by-step guide for building ARDD-TP in order. Each phase produces a runnable, testable system before the next begins.
 
-> **Current Status:** Phase 1, Steps 1-2 completed. Infrastructure and Ingest Gateway are implemented. Ready for Step 3 (Vision Service).
+> **Current Status:** Phase 1, Steps 1-5 completed. Ready for Step 6 (MLflow Telemetry).
 
 ---
 
@@ -75,12 +75,12 @@ python -c "try: import mtcnn; print('MTCNN OK') except: print('MTCNN not install
 python -c "import torch; print(f'PyTorch {torch.__version__} OK')"
 ```
 
-### Step 4 — RAG Context Agent
-- [ ] FastAPI app with `POST /audit` and `GET /health`
-- [ ] Load threat signatures into FAISS in-memory vector store
-- [ ] Semantic search with similarity threshold ≥ 0.75
-- [ ] LangChain + Ollama/Mistral verdict generation
-- [ ] `X-API-Key` auth middleware
+### Step 4 — RAG Context Agent ✅ COMPLETED
+- [x] FastAPI app with `POST /audit` and `GET /health`
+- [x] Load threat signatures into FAISS in-memory vector store
+- [x] Semantic search with similarity threshold ≥ 0.75
+- [x] LangChain + Ollama/Mistral verdict generation
+- [x] `X-API-Key` auth middleware
 
 **Verification commands:**
 ```bash
@@ -95,16 +95,16 @@ python -c "import faiss; print('FAISS OK')"
 curl -f http://ollama:11434/api/version || echo "Ollama not running"
 ```
 
-### Step 5 — Aggregation Service
-- [ ] FastAPI app with `POST /aggregate`, `POST /auth/token`, `GET /health`
-- [ ] Call Vision → RAG sequentially; enforce 100ms RAG timeout
-- [ ] Compute `final_score` with RAG boost (`β = 0.15` on `FAIL`)
-- [ ] Clamp `final_score` to `[0.0, 1.0]`
-- [ ] Rolling 5-frame alert window; set `alert: true` when `final_score > 0.90`
-- [ ] Emit `AggregatedResult` to MLflow and WebSocket broadcaster
-- [ ] JWT issuance (HS256, 1hr expiry) on `POST /auth/token`
-- [ ] Kafka `labels` topic consumer: receive `GroundTruthLabel` events, join to stored `AggregatedResult` by `(stream_id, frame_index)`, forward labelled frames to drift monitor
-- [ ] In-memory label buffer: hold up to 500 unmatched labels; drop oldest on overflow; flush matched labels immediately
+### Step 5 — Aggregation Service ✅ COMPLETED
+- [x] FastAPI app with `POST /aggregate`, `POST /auth/token`, `GET /health`
+- [x] Call Vision → RAG sequentially; enforce 100ms RAG timeout
+- [x] Compute `final_score` with RAG boost (`β = 0.15` on `FAIL`)
+- [x] Clamp `final_score` to `[0.0, 1.0]`
+- [x] Rolling 5-frame alert window; set `alert: true` when `final_score > 0.90`
+- [x] Emit `AggregatedResult` to MLflow and WebSocket broadcaster
+- [x] JWT issuance (HS256, 1hr expiry) on `POST /auth/token`
+- [x] Kafka `labels` topic consumer: receive `GroundTruthLabel` events, join to stored `AggregatedResult` by `(stream_id, frame_index)`, forward labelled frames to drift monitor
+- [x] In-memory label buffer: hold up to 500 unmatched labels; drop oldest on overflow; flush matched labels immediately
 
 **Verification commands:**
 ```bash

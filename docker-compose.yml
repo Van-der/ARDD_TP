@@ -57,6 +57,8 @@ services:
     container_name: vision-service
     depends_on:
       - kafka
+    ports:
+      - "8001:8001"
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_FRAMES=frames
@@ -76,10 +78,14 @@ services:
       context: ./rag-agent
       dockerfile: Dockerfile
     container_name: rag-agent
+    depends_on:
+      - ollama
+    ports:
+      - "8002:8002"
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - FAISS_INDEX_PATH=/app/data/threat_signatures.faiss
+      - OLLAMA_HOST=http://ollama:11434
+      - MOCK_LLM=${MOCK_LLM:-true}
     networks:
       - ardd_net
     restart: unless-stopped
@@ -99,9 +105,12 @@ services:
         condition: service_healthy
       rag-agent:
         condition: service_healthy
+    ports:
+      - "8003:8003"
     environment:
-      - VISION_SERVICE_URL=http://vision-service:8001
-      - RAG_AGENT_URL=http://rag-agent:8002
+      # These env var names must match aggregation-service/main.py
+      - VISION_URL=http://vision-service:8001/infer
+      - RAG_URL=http://rag-agent:8002/audit
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - MLFLOW_TRACKING_URI=http://mlflow:5000
@@ -117,9 +126,11 @@ services:
       retries: 3
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:latest
+    image: ghcr.io/mlflow/mlflow:2.11.1
     container_name: mlflow
     command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow-artifacts
+    ports:
+      - "5000:5000"
     environment:
       - MLFLOW_TRACKING_TOKEN=${MLFLOW_TRACKING_TOKEN}
     volumes:
@@ -127,6 +138,19 @@ services:
     networks:
       - ardd_net
     restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama-data:/root/.ollama
+    networks:
+      - ardd_net
+    restart: unless-stopped
+    # After first start, pull the model:
+    # docker exec ollama ollama pull mistral
 
   frontend:
     build:
