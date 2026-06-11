@@ -40,6 +40,21 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 
 ---
 
+## 3b. Temporal Service (Batch Layer) — *Phase 2*
+
+| Scenario | Detection | Response | Logged |
+|---|---|---|---|
+| Temporal Service crash / unavailable | HTTP connection error from Aggregation | Speed Layer continues unaffected; Dashboard Audit Panel shows **"Temporal Audit Unavailable — Relying on Spatial heuristics"** | Yes — MLflow `temporal_unavailable` flag |
+| Temporal Service inference timeout (>5s) | Aggregation deadline exceeded | Return `temporal_verdict: "UNKNOWN"`, `low_confidence_flag: true` | Yes — MLflow |
+| Incomplete 30-second buffer (stream drops early) | Buffer size `N < 900` at flush time | Zero-pad tensor to `[900, 1024]`; set `low_confidence_flag: true`; continue inference | Yes — MLflow |
+| Extremely incomplete buffer (`N < 300`, <10s of data) | Buffer size check before inference | Skip inference entirely; return `temporal_verdict: "UNKNOWN"` immediately | Yes — MLflow |
+| Frame gaps in 30-second window | Non-contiguous `frame_index` in buffer | Linearly interpolate missing feature vectors from adjacent neighbours; log `frames_interpolated` count | Yes — MLflow |
+| Feature vector decode error | Base64 / numpy deserialization failure | Drop vector from buffer; log `vector_decode_error`; continue buffering | Yes — service logs |
+| Pre-trained model weights missing | File load exception at startup | Service fails to start; Docker Compose restart policy triggers; Dashboard shows "Temporal Audit Unavailable" | Yes — service logs |
+| Redis buffer unavailable (Phase 2+) | Redis connection error | Fall back to in-memory Python deque (limited to last 900 items); log `redis_fallback` | Yes — MLflow |
+
+---
+
 ## 4. RAG Context Agent
 
 | Scenario | Detection | Response | Logged |

@@ -35,6 +35,11 @@
 - `test_fps_downsampling`: assert frame rate drops to 5 FPS when lag flag is set.
 - `test_invalid_jpeg`: assert frame is dropped and `decode_error` is incremented for a corrupt JPEG.
 
+### React Dashboard (Frontend)
+- `test_buffer_cap`: assert `frames` array caps at 100 entries.
+- `test_alert_state_toggle`: assert `activeAlert` toggles correctly based on `alert` flag in incoming WebSocket frames.
+- `test_auth_state`: assert `token` and `connected` logic update accurately.
+
 ---
 
 ## 3. Integration Tests

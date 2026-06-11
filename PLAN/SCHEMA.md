@@ -5,8 +5,10 @@
 > - `frame_index` — zero-based frame sequence number
 > - `timestamp_ms` — Unix epoch milliseconds
 > - `latency_ms` — processing duration in milliseconds
-> - `deepfake_score` — float 0.0–1.0 from Vision Service
+> - `deepfake_score` — float 0.0–1.0 from Vision Service (Speed Layer)
+> - `temporal_score` — float 0.0–1.0 from Temporal Service (Batch Layer, every 30s)
 > - `audit_verdict` — string `PASS | FAIL | UNKNOWN` from RAG / Aggregation
+> - `feature_vector` — 1024-d float array, penultimate EfficientNet-B4 layer output
 
 ---
 
@@ -25,17 +27,20 @@ Published by the Ingest Gateway to the `frames` Kafka topic.
 
 ## 2. Vision Service Result
 
-Returned by the FastAPI Vision Node after inference.
+Returned by the FastAPI Vision Node after inference. Includes both the immediate classification score and the raw feature vector for downstream temporal analysis.
 
 ```json
 {
   "stream_id": "string",
   "frame_index": "integer",
   "deepfake_score": "float (0.0–1.0)",
+  "feature_vector": "array<float> — 1024 elements, penultimate EfficientNet-B4 layer",
   "aligned": "boolean",
   "latency_ms": "integer"
 }
 ```
+
+> `feature_vector` is `null` when `aligned: false` (no face detected). It is base64-encoded as `numpy.float32.tobytes()` for Kafka transport; decoded by the Temporal Service consumer.
 
 ## 3. RAG Audit Verdict
 
@@ -53,7 +58,7 @@ Returned by the LangChain Auditor after contextual verification.
 
 ## 4. Aggregated Result
 
-Produced by the Aggregation Service by merging Vision Result and RAG Audit Verdict. This is the canonical payload consumed by MLflow and the WebSocket broadcaster.
+Produced by the Aggregation Service by merging Vision Result and RAG Audit Verdict. This is the canonical payload consumed by MLflow and the WebSocket broadcaster for the **Speed Layer** (per-frame, 200ms SLA).
 
 ```json
 {
@@ -71,6 +76,30 @@ Produced by the Aggregation Service by merging Vision Result and RAG Audit Verdi
 ```
 
 > `rag_used: false` when the RAG service timed out and the verdict was resolved from Vision score alone.
+
+---
+
+## 4b. Temporal Audit Result *(Phase 2 — Batch Layer)*
+
+Produced by the Temporal Service every **30 seconds** (one per 900-frame buffer window). Sent via HTTP POST to the Aggregation Service and forwarded to MLflow and the WebSocket Dashboard Audit Panel.
+
+```json
+{
+  "stream_id": "string",
+  "window_start_frame": "integer — frame_index of first vector in this window",
+  "window_end_frame": "integer — frame_index of last vector in this window",
+  "window_duration_s": "float — actual elapsed seconds covered (≤ 30s if incomplete)",
+  "temporal_score": "float (0.0–1.0) — LSTM/ViT deepfake probability over the sequence",
+  "temporal_verdict": "string (PASS | FAIL | UNKNOWN)",
+  "low_confidence_flag": "boolean — true when buffer was zero-padded (incomplete window)",
+  "frames_interpolated": "integer — number of feature vectors filled by interpolation",
+  "model_used": "string — e.g. 'dfdc-lstm-v1' or 'vit-celeb-df-v2'",
+  "latency_ms": "integer — inference time for this batch",
+  "timestamp_ms": "integer"
+}
+```
+
+> `temporal_verdict: "UNKNOWN"` is always returned when `low_confidence_flag: true` AND `window_duration_s < 10` (fewer than 10 seconds of real data — not enough for reliable sequence inference).
 
 ## 5. MLflow Telemetry Log
 

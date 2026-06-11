@@ -2,8 +2,7 @@
 .env
 .env.local
 .env.*.local
-.env.*                                                                  
-.env.example 
+.env.* 
 # Test dataset
 test_dataset/
 
@@ -43,3 +42,11 @@ temp/
 # Database files
 *.db
 *.sqlite
+
+# Node & Frontend
+node_modules/
+dist/
+dist-ssr/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

@@ -3,15 +3,17 @@ import time
 import json
 import asyncio
 import logging
+import threading
 from typing import Dict, List, Optional
 from collections import defaultdict
 
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import mlflow
+from kafka import KafkaConsumer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +30,6 @@ RAG_TIMEOUT = 0.100  # 100ms
 # Setup MLflow
 try:
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    # create or get experiment
     if not os.getenv("TESTING"):
         mlflow.set_experiment("ardd_pipeline")
 except Exception as e:
@@ -38,6 +39,11 @@ except Exception as e:
 alert_counters: Dict[str, int] = defaultdict(int)
 mlflow_buffer: List[dict] = []
 MAX_BUFFER = 100
+
+drift_history: Dict[str, List[float]] = defaultdict(list)
+labels_buffer: Dict[str, dict] = {}
+results_buffer: Dict[str, dict] = {}
+MAX_LABELS_BUFFER = 500
 
 class ConnectionManager:
     def __init__(self):
@@ -83,7 +89,87 @@ class AggregatedResult(BaseModel):
     latency_ms: int
     drift_flag: bool
 
+class TemporalAuditResult(BaseModel):
+    stream_id: str
+    window_start_frame: int
+    window_end_frame: int
+    window_duration_s: float
+    temporal_score: float
+    temporal_verdict: str
+    low_confidence_flag: bool
+    frames_interpolated: int
+    model_used: str
+    latency_ms: int
+    timestamp_ms: int
+
 app = FastAPI()
+
+def process_labeled_result(result: dict, label: str):
+    if label == "REAL":
+        stream_id = result["stream_id"]
+        confidence = 1.0 - result["deepfake_score"]
+        drift_history[stream_id].append(confidence)
+        if len(drift_history[stream_id]) > 100:
+            drift_history[stream_id].pop(0)
+
+def start_kafka_consumer():
+    if os.getenv("TESTING"):
+        return
+    try:
+        consumer = KafkaConsumer(
+            os.getenv("KAFKA_TOPIC_LABELS", "labels"),
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+        )
+        for msg in consumer:
+            label_data = msg.value
+            stream_id = label_data.get("stream_id")
+            frame_index = label_data.get("frame_index")
+            label = label_data.get("label")
+            if not stream_id or frame_index is None or not label:
+                continue
+            
+            key = f"{stream_id}_{frame_index}"
+            if key in results_buffer:
+                result = results_buffer.pop(key)
+                process_labeled_result(result, label)
+            else:
+                labels_buffer[key] = label_data
+                if len(labels_buffer) > MAX_LABELS_BUFFER:
+                    oldest_key = next(iter(labels_buffer))
+                    del labels_buffer[oldest_key]
+    except Exception as e:
+        logger.error(f"Kafka consumer error: {e}")
+
+async def mlflow_flush_task():
+    while True:
+        if mlflow_buffer and not os.getenv("TESTING"):
+            items_to_flush = list(mlflow_buffer)
+            for t in items_to_flush:
+                try:
+                    with mlflow.start_run(nested=True):
+                        mlflow.log_metrics({
+                            "deepfake_score": t.get("deepfake_score", 0.0),
+                            "temporal_score": t.get("temporal_score", 0.0),
+                            "latency_ms": t.get("latency_ms", 0)
+                        })
+                        mlflow.log_params({
+                            "stream_id": t.get("stream_id", ""),
+                            "frame_index": t.get("frame_index", -1),
+                            "audit_verdict": t.get("audit_verdict", ""),
+                            "temporal_verdict": t.get("temporal_verdict", ""),
+                            "drift_flag": t.get("drift_flag", False)
+                        })
+                    mlflow_buffer.remove(t)
+                except Exception as e:
+                    logger.error(f"MLflow flush failed: {e}")
+                    break
+        await asyncio.sleep(10)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(mlflow_flush_task())
+    threading.Thread(target=start_kafka_consumer, daemon=True).start()
 
 async def verify_api_key(request: Request):
     api_key = request.headers.get("X-API-Key")
@@ -93,7 +179,6 @@ async def verify_api_key(request: Request):
 
 @app.post("/auth/token")
 async def login(req: TokenRequest):
-    # Dummy auth check for now
     if not req.client_id or not req.client_secret:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
@@ -102,7 +187,6 @@ async def login(req: TokenRequest):
 
 @app.websocket("/stream")
 async def websocket_endpoint(websocket: WebSocket, token: str = None):
-    # Simple auth for WebSocket using query param
     if not token:
         await websocket.close(code=1008)
         return
@@ -118,7 +202,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -145,19 +228,16 @@ async def call_rag(stream_id: str, frame_index: int, score: float) -> dict:
 async def aggregate(payload: FramePayload):
     start_time = time.time()
     
-    # 1. Call Vision
     try:
         vision_res = await call_vision(payload.model_dump())
     except Exception as e:
         logger.error(f"Vision failure: {e}")
-        # Broadcast pipeline_error
         err_msg = json.dumps({"event": "pipeline_error", "stream_id": payload.stream_id})
         await manager.broadcast(err_msg)
         raise HTTPException(status_code=502, detail="Vision Service returned an error; frame dropped")
 
     deepfake_score = vision_res.get("deepfake_score", 0.5)
     
-    # 2. Call RAG
     rag_used = False
     audit_verdict = "UNKNOWN"
     matched_signature = None
@@ -172,14 +252,12 @@ async def aggregate(payload: FramePayload):
     except Exception as e:
         logger.warning(f"RAG failure: {e}")
 
-    # 3. Compute final_score
     final_score = deepfake_score
     if audit_verdict == "FAIL":
-        final_score = deepfake_score * (1.0 + 0.15) # beta = 0.15
+        final_score = deepfake_score * (1.0 + 0.15)
         
     final_score = min(max(final_score, 0.0), 1.0)
     
-    # 4. Alert Threshold
     if final_score > 0.90:
         alert_counters[payload.stream_id] += 1
     else:
@@ -187,8 +265,11 @@ async def aggregate(payload: FramePayload):
         
     alert = alert_counters[payload.stream_id] >= 5
 
-    # 5. Drift Flag (mocked simple rolling logic or default to false if not enough data)
     drift_flag = False
+    if len(drift_history[payload.stream_id]) == 100:
+        avg_confidence = sum(drift_history[payload.stream_id]) / 100.0
+        if avg_confidence < 0.60:
+            drift_flag = True
 
     latency_ms = int((time.time() - start_time) * 1000)
     
@@ -205,7 +286,6 @@ async def aggregate(payload: FramePayload):
         drift_flag=drift_flag
     )
     
-    # Log MLflow
     telemetry = {
         "stream_id": payload.stream_id,
         "frame_index": payload.frame_index,
@@ -218,11 +298,24 @@ async def aggregate(payload: FramePayload):
     mlflow_buffer.append(telemetry)
     if len(mlflow_buffer) > MAX_BUFFER:
         mlflow_buffer.pop(0)
+        
+    # Check if we already have a label for this frame
+    key = f"{payload.stream_id}_{payload.frame_index}"
+    result_data = {
+        "stream_id": payload.stream_id,
+        "frame_index": payload.frame_index,
+        "deepfake_score": final_score
+    }
     
-    # Flush mlflow if possible (using async mock to avoid blocking)
-    # Real implementation would flush async or via background task
+    if key in labels_buffer:
+        label_data = labels_buffer.pop(key)
+        process_labeled_result(result_data, label_data["label"])
+    else:
+        results_buffer[key] = result_data
+        if len(results_buffer) > MAX_LABELS_BUFFER:
+            oldest_key = next(iter(results_buffer))
+            del results_buffer[oldest_key]
     
-    # Broadcast
     ws_event = {
         "stream_id": payload.stream_id,
         "frame_index": payload.frame_index,
@@ -234,6 +327,26 @@ async def aggregate(payload: FramePayload):
     await manager.broadcast(json.dumps(ws_event))
     
     return result
+
+@app.post("/temporal_audit", dependencies=[Depends(verify_api_key)])
+async def temporal_audit(payload: TemporalAuditResult):
+    ws_event = {
+        "type": "temporal_audit",
+        **payload.model_dump()
+    }
+    await manager.broadcast(json.dumps(ws_event))
+    
+    telemetry = {
+        "stream_id": payload.stream_id,
+        "temporal_score": payload.temporal_score,
+        "temporal_verdict": payload.temporal_verdict,
+        "latency_ms": payload.latency_ms
+    }
+    mlflow_buffer.append(telemetry)
+    if len(mlflow_buffer) > MAX_BUFFER:
+        mlflow_buffer.pop(0)
+    
+    return {"status": "ok"}
 
 @app.get("/health")
 async def health():

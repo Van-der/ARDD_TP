@@ -2,7 +2,7 @@
 
 A step-by-step guide for building ARDD-TP in order. Each phase produces a runnable, testable system before the next begins.
 
-> **Current Status:** Phase 1, Steps 1-5 completed. Ready for Step 6 (MLflow Telemetry).
+> **Current Status:** Phase 1 (Core Pipeline MVP) is fully completed. Ready to begin Phase 2 (Lambda Temporal Batch Layer).
 
 ---
 
@@ -124,11 +124,11 @@ print('Kafka-python import OK')
 "
 ```
 
-### Step 6 — MLflow Telemetry
-- [ ] Add MLflow service to Docker Compose
-- [ ] Log per-frame telemetry from Aggregation Service
-- [ ] Implement in-memory buffer (100 entries) for MLflow unavailability
-- [ ] Drift monitor: rolling 100-frame average on `REAL`-labelled frames; set `drift_flag: true` below 60%
+### Step 6 — MLflow Telemetry ✅ COMPLETED
+- [x] Add MLflow service to Docker Compose
+- [x] Log per-frame telemetry from Aggregation Service
+- [x] Implement in-memory buffer (100 entries) for MLflow unavailability
+- [x] Drift monitor: rolling 100-frame average on `REAL`-labelled frames; set `drift_flag: true` below 60%
 
 **Verification commands:**
 ```bash
@@ -139,12 +139,12 @@ curl -f http://localhost:5000 || echo "MLflow not running"
 python -c "import mlflow; print(f'MLflow {mlflow.__version__} OK')"
 ```
 
-### Step 7 — WebSocket & React Dashboard
-- [ ] WebSocket broadcaster on `ws://aggregation:8003/stream` with JWT auth
-- [ ] React + TypeScript + Zustand app
-- [ ] Live score graph, audit verdict display, compliance alert banner
-- [ ] Stale-data banner on disconnect; exponential backoff reconnection
-- [ ] JWT refresh logic: silently call `POST /auth/token` at 55 minutes (5 minutes before expiry); retry once on failure before prompting re-login
+### Step 7 — WebSocket & React Dashboard ✅ COMPLETED
+- [x] WebSocket broadcaster on `ws://aggregation:8003/stream` with JWT auth
+- [x] React + TypeScript + Zustand app
+- [x] Live score graph, audit verdict display, compliance alert banner
+- [x] Stale-data banner on disconnect; exponential backoff reconnection
+- [x] JWT refresh logic: silently call `POST /auth/token` at 55 minutes (5 minutes before expiry); retry once on failure before prompting re-login
 
 **Verification commands:**
 ```bash
@@ -196,7 +196,136 @@ locust -f locustfile.py --headless -u 1 -r 1 -t 5m --host=http://localhost:8003
 
 ---
 
-## Phase 2 — Performance & Scalability
+## Phase 2 — Lambda Architecture: Temporal Batch Layer
+
+**Goal:** Introduce a parallel Batch Layer alongside the Speed Layer, forming a true Lambda Architecture for dual-SLA deepfake detection. No raw frames are buffered — only lightweight 1024-d feature vectors.
+
+**Prerequisites:** Phase 1 complete and all exit criteria passing.
+
+### Step 2.1 — Modify Vision Service: Expose Feature Vector
+- [ ] Extract the penultimate EfficientNet-B4 layer output (1024-d flattened tensor) during each `/infer` call
+- [ ] Add `feature_vector: List[float]` field to `VisionResult` schema
+- [ ] When `aligned: false`, set `feature_vector: null`
+- [ ] Publish `VisionResult` (including `feature_vector`) to Kafka `frames_processed` topic (base64-encoded `numpy.float32.tobytes()`)
+
+**Verification:**
+```bash
+curl -X POST http://localhost:8001/infer \
+  -H "X-API-Key: $KEY" \
+  -d '{"stream_id":"test","frame_index":0,"timestamp_ms":0,"payload":"<b64>"}' \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); print(len(r['feature_vector']), 'dimensions')"
+# Expected: 1024 dimensions
+```
+
+### Step 2.2 — Update Kafka Schema
+- [ ] Update `VisionResult` Kafka payload to include `feature_vector` as base64 string
+- [ ] Update `SCHEMA.md` (already done)
+- [ ] Update consumer deserialization in Temporal Service
+
+### Step 2.3 — Build Temporal Service: Buffer Node
+- [ ] New service `./temporal-service/` with `main.py`, `Dockerfile`, `requirements.txt`
+- [ ] Kafka consumer subscribed to `frames_processed` topic
+- [ ] Python `deque(maxlen=900)` buffer per `stream_id`; track `frame_index` for gap detection
+- [ ] Print/log `"Buffer Full: 900 frames"` every time buffer hits 900 vectors, then clear
+- [ ] `GET /health` endpoint returning `{status, buffer_sizes, uptime_s}`
+- [ ] `GET /batch_status` endpoint returning per-stream buffer fill levels
+- [ ] `POST /flush` endpoint to manually trigger early flush (for testing)
+- [ ] `X-API-Key` auth middleware on all endpoints
+- [ ] Port: **8004**
+
+**Verification:**
+```bash
+# Build and test buffer node
+docker build -t ardd-temporal ./temporal-service
+docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal pytest tests/ -v
+
+# Check buffer status
+curl http://localhost:8004/batch_status -H "X-API-Key: $KEY"
+# Expected: {"stream_id": "cam_01", "buffer_size": <N>, "target": 900}
+```
+
+### Step 2.4 — Integrate Pre-trained Sequence Model
+- [ ] Download DFDC LSTM weights (Selim Seferbekov) OR TimeSformer/ViT weights (Celeb-DF)
+- [ ] Load model at startup; verify weights load without error
+- [ ] On buffer flush: stack feature vectors into `[900, 1024]` tensor; run inference; produce `TemporalAuditResult`
+- [ ] POST `TemporalAuditResult` to Aggregation Service `POST /temporal_audit`
+
+**Verification:**
+```bash
+# Test model loads
+docker exec temporal-service python -c "from main import temporal_model; print('Model OK')"
+
+# Trigger a manual flush with test data
+curl -X POST http://localhost:8004/flush -H "X-API-Key: $KEY" -d '{"stream_id":"test"}'
+# Expected: {"temporal_score": <float>, "temporal_verdict": "PASS|FAIL|UNKNOWN", ...}
+```
+
+### Step 2.5 — Implement Buffer Resilience
+- [ ] Zero-pad incomplete tensor to `[900, 1024]` when `N < 900`; set `low_confidence_flag: true`
+- [ ] Return `temporal_verdict: "UNKNOWN"` immediately when `N < 300` (< 10 seconds of data)
+- [ ] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing vectors
+- [ ] Include `frames_interpolated` count in `TemporalAuditResult`
+
+**Verification:**
+```bash
+# Test padding (send only 500 vectors then flush)
+curl -X POST http://localhost:8004/flush -H "X-API-Key: $KEY" -d '{"stream_id":"test"}'
+# Expected: low_confidence_flag: true in response
+
+# Test sparse buffer (send <300 vectors then flush)
+# Expected: temporal_verdict: "UNKNOWN" immediately
+```
+
+### Step 2.6 — Aggregation Service: Temporal Path
+- [ ] Add `POST /temporal_audit` endpoint to Aggregation Service (accepts `TemporalAuditResult`)
+- [ ] Store latest `TemporalAuditResult` per `stream_id` in memory
+- [ ] Broadcast `TemporalAuditResult` to WebSocket clients as a distinct event type (`"type": "temporal_audit"`)
+- [ ] Log `TemporalAuditResult` to MLflow (separate experiment or run from per-frame logs)
+- [ ] Aggregation Service `GET /health` to show `temporal_service_status`
+
+**Verification:**
+```bash
+curl -X POST http://localhost:8003/temporal_audit \
+  -H "X-API-Key: $KEY" \
+  -d '{"stream_id":"test","window_start_frame":0,"window_end_frame":899,"temporal_score":0.3,"temporal_verdict":"PASS",...}'
+# Expected: 200 OK
+```
+
+### Step 2.7 — React Dashboard: Audit Panel
+- [ ] Add "Audit Panel" sidebar to React dashboard
+- [ ] Subscribe to WebSocket `temporal_audit` events
+- [ ] Display periodic text report: `"Temporal Analysis of last 30s: <score>% Natural Continuity. <verdict>."`
+- [ ] Show `"Temporal Audit Unavailable — Relying on Spatial heuristics"` when `temporal_service_status` is down
+- [ ] Show `low_confidence_flag` warning badge when set
+
+### Step 2.8 — Tests
+- [ ] `temporal-service/tests/test_temporal.py`:
+  - Buffer fill and flush trigger
+  - Correct tensor shape `[900, 1024]`
+  - Zero-padding logic (`low_confidence_flag` set correctly)
+  - Sparse buffer → `UNKNOWN` without inference
+  - Linear interpolation (insert gap, verify `frames_interpolated > 0`)
+  - LSTM/ViT inference produces valid `temporal_score` in `[0.0, 1.0]`
+  - `TemporalAuditResult` schema validation
+  - Auth 401 on missing `X-API-Key`
+
+**Verification:**
+```bash
+docker build -t ardd-temporal ./temporal-service
+docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal pytest tests/ -v
+# Expected: All tests pass
+```
+
+**Phase 2 exit criteria:**
+- Both Speed Layer (200ms SLA) and Batch Layer (30s cycle) operating simultaneously without interference
+- Temporal Service crash does not affect Speed Layer or live dashboard scores
+- All buffer resilience conditions (padding, interpolation, sparse) correctly handled and tested
+- React Dashboard shows both Live Ticker and Audit Panel updating independently
+- All Temporal Service tests pass
+
+---
+
+## Phase 3 — Performance & Scalability
 
 **Goal:** Handle multiple concurrent streams reliably.
 
@@ -249,7 +378,7 @@ docker compose up -d --scale vision-service=2
 
 ---
 
-## Phase 3 — Advanced Analytics
+## Phase 4 — Advanced Analytics
 
 **Goal:** Temporal analysis and cross-stream threat intelligence.
 
@@ -304,7 +433,7 @@ grep -i "rollback" logs/vision.log
 
 ---
 
-## Phase 4 — Hardening & Compliance
+## Phase 5 — Hardening & Compliance
 
 **Goal:** Production-ready audit trail and operational tooling.
 
