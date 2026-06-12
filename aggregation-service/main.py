@@ -5,7 +5,7 @@ import asyncio
 import logging
 import threading
 from typing import Dict, List, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import httpx
 import jwt
@@ -17,6 +17,7 @@ from kafka import KafkaConsumer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+START_TIME = time.time()
 
 # Config
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
@@ -25,6 +26,7 @@ VISION_URL = os.getenv("VISION_URL", "http://vision-service:8001/infer")
 RAG_URL = os.getenv("RAG_URL", "http://rag-agent:8002/audit")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 RAG_TIMEOUT = 0.100  # 100ms
 
 # Setup MLflow
@@ -40,7 +42,8 @@ alert_counters: Dict[str, int] = defaultdict(int)
 mlflow_buffer: List[dict] = []
 MAX_BUFFER = 100
 
-drift_history: Dict[str, List[float]] = defaultdict(list)
+# Rolling deque per stream (maxlen=100 enforces the sliding window automatically)
+drift_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
 labels_buffer: Dict[str, dict] = {}
 results_buffer: Dict[str, dict] = {}
 MAX_LABELS_BUFFER = 500
@@ -108,9 +111,7 @@ def process_labeled_result(result: dict, label: str):
     if label == "REAL":
         stream_id = result["stream_id"]
         confidence = 1.0 - result["deepfake_score"]
-        drift_history[stream_id].append(confidence)
-        if len(drift_history[stream_id]) > 100:
-            drift_history[stream_id].pop(0)
+        drift_history[stream_id].append(confidence)  # deque(maxlen=100) auto-trims
 
 def start_kafka_consumer():
     if os.getenv("TESTING"):
@@ -266,8 +267,9 @@ async def aggregate(payload: FramePayload):
     alert = alert_counters[payload.stream_id] >= 5
 
     drift_flag = False
-    if len(drift_history[payload.stream_id]) == 100:
-        avg_confidence = sum(drift_history[payload.stream_id]) / 100.0
+    history = drift_history[payload.stream_id]
+    if len(history) >= 100:  # rolling: evaluate continuously once window is full
+        avg_confidence = sum(history) / len(history)
         if avg_confidence < 0.60:
             drift_flag = True
 
@@ -291,6 +293,7 @@ async def aggregate(payload: FramePayload):
         "frame_index": payload.frame_index,
         "deepfake_score": final_score,
         "audit_verdict": audit_verdict,
+        "rag_used": rag_used,
         "latency_ms": latency_ms,
         "drift_flag": drift_flag
     }
@@ -325,8 +328,36 @@ async def aggregate(payload: FramePayload):
         "timestamp_ms": payload.timestamp_ms
     }
     await manager.broadcast(json.dumps(ws_event))
-    
+
+    # Webhook alert delivery (3 attempts with backoff) — SCHEMA.md §8
+    if alert and WEBHOOK_URL:
+        webhook_payload = {
+            "event": "deepfake_alert",
+            "stream_id": payload.stream_id,
+            "frame_index": payload.frame_index,
+            "final_score": final_score,
+            "audit_verdict": audit_verdict,
+            "timestamp_ms": payload.timestamp_ms
+        }
+        asyncio.create_task(_deliver_webhook(webhook_payload))
+
     return result
+
+
+async def _deliver_webhook(payload: dict, max_attempts: int = 3) -> None:
+    """Deliver webhook alert with 3-attempt exponential backoff."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(WEBHOOK_URL, json=payload, timeout=5.0)
+                resp.raise_for_status()
+                logger.info(f"Webhook delivered on attempt {attempt}")
+                return
+        except Exception as e:
+            logger.warning(f"Webhook delivery attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+    logger.error("Webhook delivery failed after 3 attempts")
 
 @app.post("/temporal_audit", dependencies=[Depends(verify_api_key)])
 async def temporal_audit(payload: TemporalAuditResult):
@@ -350,4 +381,4 @@ async def temporal_audit(payload: TemporalAuditResult):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "aggregation-service", "uptime_s": 0}
+    return {"status": "ok", "service": "aggregation-service", "uptime_s": int(time.time() - START_TIME)}

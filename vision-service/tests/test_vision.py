@@ -87,13 +87,47 @@ def test_frequency_branch_random():
 
 # ── Unit: score combination formula (TESTING.md §2) ────────────────────────
 
-def test_score_combination():
-    """deepfake_score = 0.6·spatial + 0.4·frequency within float tolerance (TESTING.md §2)."""
-    spatial = 0.7
-    frequency = 0.4
-    expected = 0.6 * spatial + 0.4 * frequency  # 0.58
-    computed = 0.6 * spatial + 0.4 * frequency
-    assert abs(computed - expected) < 1e-6, f"Formula mismatch: {computed} vs {expected}"
+def test_score_combination(monkeypatch):
+    """deepfake_score = 0.6·spatial + 0.4·frequency — verifies the implementation, not just the formula."""
+    import sys
+    import os
+    import numpy as np
+    
+    # Patch spatial branch to return a fixed known value
+    from unittest.mock import patch, MagicMock
+    import torch
+
+    fixed_spatial = 0.7
+    fixed_frequency = 0.4
+    expected_score = round(0.6 * fixed_spatial + 0.4 * fixed_frequency, 6)  # 0.58
+
+    # We need a valid JPEG payload — use blank image
+    import cv2
+    import base64
+    img = np.zeros((100, 100, 3), dtype=np.uint8)
+    _, buf = cv2.imencode('.jpg', img)
+    payload_b64 = base64.b64encode(buf.tobytes()).decode()
+
+    with patch('main.spatial_branch') as mock_spatial, \
+         patch('main.mtcnn') as mock_mtcnn, \
+         patch('main.extract_frequency_score', return_value=fixed_frequency):
+
+        # Simulate MTCNN finding a face box
+        mock_mtcnn.detect.return_value = (
+            [[5, 5, 95, 95]],  # boxes
+            [0.99]             # probs
+        )
+        # Simulate spatial branch returning fixed score
+        mock_spatial.return_value = torch.tensor([[fixed_spatial]])
+
+        body = {"stream_id": "s1", "frame_index": 0, "timestamp_ms": 1, "payload": payload_b64}
+        r = client.post("/infer", json=body, headers=HEADERS)
+
+    assert r.status_code == 200, r.text
+    actual_score = r.json()["deepfake_score"]
+    assert abs(actual_score - expected_score) < 0.05, (
+        f"Score combination formula not applied correctly: got {actual_score}, expected ~{expected_score}"
+    )
 
 def test_score_combination_boundary_zero():
     expected = 0.6 * 0.0 + 0.4 * 0.0

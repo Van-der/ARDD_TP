@@ -2,7 +2,7 @@
 
 A step-by-step guide for building ARDD-TP in order. Each phase produces a runnable, testable system before the next begins.
 
-> **Current Status:** Phase 1 (Core Pipeline MVP) is fully completed. Ready to begin Phase 2 (Lambda Temporal Batch Layer).
+> **Current Status:** Phase 1 (Core Pipeline MVP) fully completed and compliance-verified. All P0/P1 audit defects resolved. Ready to begin Phase 2 (Lambda Temporal Batch Layer).
 
 ---
 

@@ -21,11 +21,13 @@ START_TIME = time.time()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 mtcnn = MTCNN(keep_all=False, device=device)
 
-# Dummy EfficientNet-B4 logic (untrained model)
+# Dummy EfficientNet-B4 logic (pre-trained ImageNet model as a placeholder instead of random weights)
 class SpatialBranch(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = models.efficientnet_b4(weights=None)
+        # Load pre-trained ImageNet weights so features aren't completely random noise
+        self.model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.DEFAULT)
+        # Modify the classification head for binary output
         self.model.classifier[1] = nn.Linear(self.model.classifier[1].in_features, 1)
         self.sigmoid = nn.Sigmoid()
         
@@ -34,6 +36,17 @@ class SpatialBranch(nn.Module):
 
 spatial_branch = SpatialBranch().to(device)
 spatial_branch.eval()
+
+# Load weights from disk if they exist (for actual trained deepfake models)
+MODEL_WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "/app/weights/efficientnet_b4.pth")
+if os.path.exists(MODEL_WEIGHTS_PATH):
+    try:
+        spatial_branch.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=device))
+        print(f"Loaded trained weights from {MODEL_WEIGHTS_PATH}")
+    except Exception as e:
+        print(f"Failed to load weights from {MODEL_WEIGHTS_PATH}, falling back to ImageNet: {e}")
+else:
+    print("No trained weights found at path. Using base ImageNet weights for testing.")
 
 # Helper for FFT frequency branch
 def extract_frequency_score(img_gray: np.ndarray) -> float:

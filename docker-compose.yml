@@ -43,6 +43,7 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_FRAMES=frames
+      - KAFKA_CONSUMER_GROUP=vision-service-group
       - RTSP_SOURCE=${RTSP_SOURCE:-rtsp://localhost:8554/stream}
       - FPS_TARGET=30
       - FPS_DOWNSAMPLE_THRESHOLD=500
@@ -116,6 +117,7 @@ services:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_LABELS=labels
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
     networks:
       - ardd_net
     restart: unless-stopped
@@ -138,6 +140,11 @@ services:
     networks:
       - ardd_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   ollama:
     image: ollama/ollama:latest
@@ -158,12 +165,19 @@ services:
       dockerfile: Dockerfile
     container_name: frontend
     depends_on:
-      - aggregation-service
+      aggregation-service:
+        condition: service_healthy
     environment:
-      - REACT_APP_WS_URL=ws://aggregation-service:8003/stream
-      - REACT_APP_AUTH_URL=http://aggregation-service:8003/auth/token
+      # Vite reads VITE_* env vars at build time via import.meta.env
+      - VITE_API_URL=http://aggregation-service:8003
+      - VITE_WS_URL=ws://aggregation-service:8003/stream
     ports:
       - "3000:3000"
     networks:
       - ardd_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
