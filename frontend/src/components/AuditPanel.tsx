@@ -53,7 +53,7 @@ export const AuditPanel = () => {
         ) : latestTemporalAudit ? (
           <div className="flex-col gap-3">
             <div className="flex-row justify-between">
-              <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>30s Sequence Verdict</span>
+              <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>20-Frame Sequence Verdict</span>
               {renderVerdictBadge(latestTemporalAudit.temporal_verdict)}
             </div>
             <div className="flex-row justify-between">

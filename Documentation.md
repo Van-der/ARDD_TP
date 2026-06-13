@@ -172,3 +172,56 @@ Phase 2 architecture fully resolved and documented. Ready to begin Phase 2 imple
 3. `docker-compose.yml` — wire `temporal-service`, add SASL_PLAINTEXT config
 4. `rag-agent/main.py` — replace `SimpleHashEmbeddings` with `sentence-transformers`
 5. Security one-liners: `weights_only=True`, JWT subprotocol, VITE_ env vars
+
+---
+
+## Session: 2026-06-14 — Phase 2 Implementation + Audit
+
+### Work Completed
+
+#### Phase 2 Implementation
+
+- **Kafka SASL_PLAINTEXT** wired end-to-end. Broker configured in `docker-compose.yml` using Confluent cp-kafka's double-underscore env var convention (`KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG`). `_kafka_sasl_kwargs()` helper added to `ingest-gateway/main.py`, `aggregation-service/main.py`, and `temporal-service/main.py` — reads `KAFKA_SECURITY_PROTOCOL`/`KAFKA_SASL_USERNAME`/`KAFKA_SASL_PASSWORD` from env; wired into all `KafkaProducer`, `KafkaAdminClient`, and `AIOKafkaConsumer` instances.
+
+- **`temporal-service/` built and tested.** `modeling.py` reconstructed: `DeepFakeDetector` with ResNext50 backbone + single LSTM layer + `linear1` head. Weights loaded from `model_87_acc_20_frames_final_data.pt` at startup; falls back to random-initialised weights with `model_used: "random-fallback"` if file not found. `frames_consumer_task` subscribes to `frames` Kafka topic; per-`stream_id` `deque(maxlen=20)` of `(frame_index, tensor)` tuples; on full buffer: stack to `[1, 20, 3, 112, 112]`, run inference, POST `TemporalAuditResult` to aggregation, clear buffer.
+
+- **`temporal-service/tests/test_temporal.py`** — 19 tests written and passing. Covers: health schema, batch_status auth, flush auth, unknown-stream noop, empty buffer → UNKNOWN, sparse (N<6) → UNKNOWN without inference, padded (N=12) → `low_confidence_flag: true`, full (N=20) → all 11 `TemporalAuditResult` fields validated, tensor shape `[3, 112, 112]`, window frame indices, `window_duration_s`, `frames_interpolated` always 0, `model_used`, deque `maxlen` enforcement, buffer cleared after flush, batch_status reflects live buffers. Note: linear interpolation test deferred (feature not implemented).
+
+- **`aggregation-service/main.py`** — JWT secret default raised from `"super-secret-key"` (16 bytes) to `"ardd-tp-dev-secret-key-change-me!"` (32 bytes); eliminates `InsecureKeyLengthWarning`. Dead `ConnectionManager.connect()` method removed. `_evict_oldest(d, cap=1000)` added and called after every `alert_counters` and `drift_history` update to bound unbounded defaultdict growth.
+
+- **`rag-agent/main.py`** — `HuggingFaceEmbeddings` import migrated from deprecated `langchain_community.embeddings` to `langchain_huggingface`; `langchain-huggingface` added to `rag-agent/requirements.txt`.
+
+- **`tests/e2e/test_pipeline_e2e.py`** — fixed WebSocket connection (was `?token=` query param, now `subprotocols=[token]`); fixed `KafkaProducer` missing SASL credentials; added `KAFKA_SASL_USERNAME`/`KAFKA_SASL_PASSWORD` env var reads.
+
+- **`docker-compose.yml`** — `temporal-service.depends_on` fixed from invalid mixed list+dict YAML to all-dict format with `kafka: condition: service_started` and `aggregation-service: condition: service_healthy`.
+
+#### Phase 2 Audit Findings
+
+Ran full audit of Phases 1 and 2 code. All critical issues fixed during session. Key findings:
+
+- **Memory leak fixed:** `alert_counters` and `drift_history` in aggregation-service were unbounded `defaultdict` objects growing permanently per unique `stream_id`. Ingest-gateway generates a new `stream_id = f"stream_{int(time.time())}"` on each restart, so every restart creates a new key. Fixed with `_evict_oldest` helper (drops oldest half when dict exceeds 1000 keys).
+- **YAML syntax bug fixed:** `temporal-service.depends_on` in `docker-compose.yml` mixed list and dict syntax under the same key, causing `docker compose up` to fail silently.
+- **JWT secret too short:** Default secret was 16 bytes, triggering `InsecureKeyLengthWarning` on every JWT encode/decode in 11 tests. Raised to 32 bytes.
+- **WebSocket JWT exposure:** Both the E2E test and the original WebSocket implementation leaked JWT in the URL (`?token=...`), which appears in server access logs. Migrated to `Sec-WebSocket-Protocol` subprotocol header.
+- **Test infrastructure note:** Vision-service tests cannot run on host Python 3.14 due to `facenet-pytorch` pulling `Pillow` build-from-source, which fails with `KeyError: '__version__'`. Must run in Docker (`python:3.11-slim`). All other service test suites run in host venvs.
+
+#### Test Results Summary
+
+| Service | Tests | Result |
+|---|---|---|
+| `aggregation-service` | 22 | ✅ 22/22 pass |
+| `temporal-service` | 19 | ✅ 19/19 pass |
+| `rag-agent` | 6 | ✅ 6/6 pass |
+| `ingest-gateway` | 6 | ✅ 6/6 pass |
+| `vision-service` | N/A | Requires Docker (Python 3.14 incompatibility) |
+| **Total** | **53** | **✅ 53/53** |
+
+#### Documentation Updates
+
+- **`PLAN/PHASES.md`** — Steps 2.1–2.10 checkbox audit: all completed items marked `[x]`; Step 2.4 linear interpolation and Step 2.6 frontend health fetch marked as deferred with `[ ]`. Phase 2 exit criteria updated to reflect actual status.
+- **`PLAN/ERROR_HANDLING.md`** — §3b frame-gaps row updated: linear interpolation marked NOT IMPLEMENTED, `frames_interpolated` always 0. Known Limitations block updated: eviction fix noted; linear interpolation deferred; restart state-loss risk unchanged (Phase 3 Redis).
+- **`TaskTo.md`** — Rewritten: Phase 1/2 audit items summarised as resolved. New "PENDING FOR TOMORROW" section added with 6 concrete deprecation fixes (FastAPI `on_event`, `langchain-community` FAISS, `httpx2`, Python 3.14 vision-service tests, linear interpolation, `mlflow_buffer` O(n) pop).
+
+### Status
+
+Phase 2 ✅ substantially complete. 53/53 unit tests passing across 4 services. Two items deferred: linear interpolation (`frames_interpolated` always 0) and frontend health-status wiring. Six deprecation items documented in `TaskTo.md` for next session. Ready to begin Phase 3 once deprecation items addressed.

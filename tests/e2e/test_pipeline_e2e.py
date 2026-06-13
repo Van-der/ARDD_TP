@@ -11,6 +11,8 @@ from kafka import KafkaProducer
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 AGGREGATION_URL = os.getenv("AGGREGATION_URL", "http://localhost:8003")
 WS_URL = os.getenv("WS_URL", "ws://localhost:8003/stream")
+KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "admin")
+KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "admin-secret")
 CLIENT_ID = "test_client"
 CLIENT_SECRET = "test_secret"
 
@@ -28,24 +30,28 @@ def test_e2e_kafka_to_websocket_latency():
     E2E Test: Publish to Kafka -> Receive on WebSocket within 200ms.
     Requires the full Docker Compose stack to be running.
     """
-    # 1. Connect to WebSocket
+    # 1. Connect to WebSocket using JWT via Sec-WebSocket-Protocol subprotocol
     token = get_auth_token()
     ws = websocket.WebSocket()
-    ws.connect(f"{WS_URL}?token={token}")
-    
-    # 2. Connect to Kafka
+    ws.connect(WS_URL, subprotocols=[token])
+
+    # 2. Connect to Kafka with SASL_PLAINTEXT
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        security_protocol='SASL_PLAINTEXT',
+        sasl_mechanism='PLAIN',
+        sasl_plain_username=KAFKA_SASL_USERNAME,
+        sasl_plain_password=KAFKA_SASL_PASSWORD,
     )
-    
+
     # Create a dummy frame
     import cv2
     import numpy as np
     img = np.zeros((100, 100, 3), dtype=np.uint8)
     _, buf = cv2.imencode('.jpg', img)
     b64_payload = base64.b64encode(buf.tobytes()).decode('utf-8')
-    
+
     stream_id = f"e2e_test_{int(time.time())}"
     payload = {
         "stream_id": stream_id,
@@ -53,16 +59,16 @@ def test_e2e_kafka_to_websocket_latency():
         "timestamp_ms": int(time.time() * 1000),
         "payload": b64_payload
     }
-    
+
     # 3. Publish and measure time
     start_time = time.time()
     producer.send("frames", payload)
     producer.flush()
-    
+
     # 4. Wait for WebSocket message
     ws.settimeout(2.0)
     received_message = False
-    
+
     while True:
         try:
             msg_str = ws.recv()
@@ -73,11 +79,11 @@ def test_e2e_kafka_to_websocket_latency():
                 break
         except websocket.WebSocketTimeoutException:
             break
-            
+
     ws.close()
-    
+
     assert received_message is True, "Did not receive WebSocket event for published frame."
-    
+
     # 5. Assert latency < 200ms
     latency_ms = (end_time - start_time) * 1000
     assert latency_ms <= 200, f"End-to-end latency exceeded 200ms SLA: took {latency_ms:.2f}ms"

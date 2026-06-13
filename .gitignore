@@ -53,3 +53,6 @@ yarn-error.log*
 
 #MD
 TaskTo.md
+
+# Ollama local models
+ollama-data/

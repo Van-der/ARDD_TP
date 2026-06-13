@@ -11,6 +11,20 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_KAFKA_SECURITY_PROTOCOL = os.getenv('KAFKA_SECURITY_PROTOCOL', 'PLAINTEXT')
+_KAFKA_SASL_USERNAME = os.getenv('KAFKA_SASL_USERNAME', '')
+_KAFKA_SASL_PASSWORD = os.getenv('KAFKA_SASL_PASSWORD', '')
+
+def _kafka_sasl_kwargs() -> dict:
+    if _KAFKA_SECURITY_PROTOCOL == 'SASL_PLAINTEXT':
+        return {
+            'security_protocol': 'SASL_PLAINTEXT',
+            'sasl_mechanism': 'PLAIN',
+            'sasl_plain_username': _KAFKA_SASL_USERNAME,
+            'sasl_plain_password': _KAFKA_SASL_PASSWORD,
+        }
+    return {}
+
 class IngestGateway:
     def __init__(self):
         self.kafka_bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092')
@@ -22,7 +36,8 @@ class IngestGateway:
         
         self.producer = KafkaProducer(
             bootstrap_servers=self.kafka_bootstrap,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            **_kafka_sasl_kwargs()
         )
         
         self.cap: Optional[cv2.VideoCapture] = None
@@ -128,7 +143,7 @@ class IngestGateway:
             return
 
         try:
-            admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap)
+            admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap, **_kafka_sasl_kwargs())
             # Fetch consumer group offsets and partition offsets to compute lag
             consumer_offsets = admin.list_consumer_group_offsets(self.consumer_group)
             admin.close()
@@ -137,7 +152,7 @@ class IngestGateway:
             for tp, offset_meta in consumer_offsets.items():
                 # Get end offset for this partition
                 from kafka import KafkaConsumer as _KC
-                tmp = _KC(bootstrap_servers=self.kafka_bootstrap)
+                tmp = _KC(bootstrap_servers=self.kafka_bootstrap, **_kafka_sasl_kwargs())
                 end = tmp.end_offsets([tp]).get(tp, 0)
                 tmp.close()
                 lag = max(0, end - offset_meta.offset)

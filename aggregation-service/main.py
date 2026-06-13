@@ -3,7 +3,6 @@ import time
 import json
 import asyncio
 import logging
-import threading
 from typing import Dict, List, Optional
 from collections import defaultdict, deque
 
@@ -13,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSock
 from pydantic import BaseModel
 
 import mlflow
-from kafka import KafkaConsumer
+from aiokafka import AIOKafkaConsumer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,14 +20,27 @@ START_TIME = time.time()
 
 # Config
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
-JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
+JWT_SECRET = os.getenv("JWT_SECRET", "ardd-tp-dev-secret-key-change-me!")
 VISION_URL = os.getenv("VISION_URL", "http://vision-service:8001/infer")
 RAG_URL = os.getenv("RAG_URL", "http://rag-agent:8002/audit")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 RAG_TIMEOUT = 0.100  # 100ms
+
+def _kafka_sasl_kwargs() -> dict:
+    if KAFKA_SECURITY_PROTOCOL == "SASL_PLAINTEXT":
+        return {
+            "security_protocol": "SASL_PLAINTEXT",
+            "sasl_mechanism": "PLAIN",
+            "sasl_plain_username": KAFKA_SASL_USERNAME,
+            "sasl_plain_password": KAFKA_SASL_PASSWORD,
+        }
+    return {}
 
 # Setup MLflow
 try:
@@ -42,6 +54,7 @@ except Exception as e:
 alert_counters: Dict[str, int] = defaultdict(int)
 mlflow_buffer: List[dict] = []
 MAX_BUFFER = 100
+MAX_STREAMS = 1000  # cap on unique stream_id keys to prevent unbounded memory growth
 
 # Rolling deque per stream (maxlen=100 enforces the sliding window automatically)
 drift_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
@@ -49,13 +62,16 @@ labels_buffer: Dict[str, dict] = {}
 results_buffer: Dict[str, dict] = {}
 MAX_LABELS_BUFFER = 500
 
+def _evict_oldest(d: dict, cap: int) -> None:
+    """Evict oldest half of keys when dict exceeds cap."""
+    if len(d) > cap:
+        to_drop = list(d.keys())[:len(d) // 2]
+        for k in to_drop:
+            del d[k]
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
@@ -114,16 +130,19 @@ def process_labeled_result(result: dict, label: str):
         confidence = 1.0 - result["deepfake_score"]
         drift_history[stream_id].append(confidence)  # deque(maxlen=100) auto-trims
 
-def start_kafka_consumer():
+async def start_labels_consumer():
     if os.getenv("TESTING"):
         return
+    consumer = AIOKafkaConsumer(
+        os.getenv("KAFKA_TOPIC_LABELS", "labels"),
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id="aggregation-labels-group",
+        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+        **_kafka_sasl_kwargs()
+    )
+    await consumer.start()
     try:
-        consumer = KafkaConsumer(
-            os.getenv("KAFKA_TOPIC_LABELS", "labels"),
-            bootstrap_servers=KAFKA_BOOTSTRAP,
-            value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-        )
-        for msg in consumer:
+        async for msg in consumer:
             label_data = msg.value
             stream_id = label_data.get("stream_id")
             frame_index = label_data.get("frame_index")
@@ -141,7 +160,32 @@ def start_kafka_consumer():
                     oldest_key = next(iter(labels_buffer))
                     del labels_buffer[oldest_key]
     except Exception as e:
-        logger.error(f"Kafka consumer error: {e}")
+        logger.error(f"Kafka labels consumer error: {e}")
+    finally:
+        await consumer.stop()
+
+async def start_frames_consumer():
+    if os.getenv("TESTING"):
+        return
+    consumer = AIOKafkaConsumer(
+        "frames",
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id="aggregation-pipeline-group",
+        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+        **_kafka_sasl_kwargs()
+    )
+    await consumer.start()
+    try:
+        async for msg in consumer:
+            try:
+                payload = FramePayload(**msg.value)
+                await process_frame_payload(payload)
+            except Exception as e:
+                logger.error(f"Pipeline error processing frame: {e}")
+    except Exception as e:
+        logger.error(f"Kafka frames consumer error: {e}")
+    finally:
+        await consumer.stop()
 
 async def mlflow_flush_task():
     while True:
@@ -171,7 +215,8 @@ async def mlflow_flush_task():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(mlflow_flush_task())
-    threading.Thread(target=start_kafka_consumer, daemon=True).start()
+    asyncio.create_task(start_labels_consumer())
+    asyncio.create_task(start_frames_consumer())
 
 async def verify_api_key(request: Request):
     api_key = request.headers.get("X-API-Key")
@@ -188,7 +233,9 @@ async def login(req: TokenRequest):
     return {"access_token": token, "expires_in": 3600}
 
 @app.websocket("/stream")
-async def websocket_endpoint(websocket: WebSocket, token: str = None):
+async def websocket_endpoint(websocket: WebSocket):
+    # JWT passed via Sec-WebSocket-Protocol subprotocol — avoids token leakage in server access logs
+    token = websocket.headers.get("sec-websocket-protocol", "").split(",")[0].strip()
     if not token:
         await websocket.close(code=1008)
         return
@@ -201,7 +248,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
         await websocket.close(code=1008)
         return
 
-    await manager.connect(websocket)
+    await websocket.accept(subprotocol=token)
+    manager.active_connections.append(websocket)
     try:
         while True:
             await websocket.receive_text()
@@ -226,8 +274,7 @@ async def call_rag(stream_id: str, frame_index: int, score: float) -> dict:
         resp.raise_for_status()
         return resp.json()
 
-@app.post("/aggregate", response_model=AggregatedResult, dependencies=[Depends(verify_api_key)])
-async def aggregate(payload: FramePayload):
+async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     start_time = time.time()
     
     try:
@@ -264,11 +311,13 @@ async def aggregate(payload: FramePayload):
         alert_counters[payload.stream_id] += 1
     else:
         alert_counters[payload.stream_id] = 0
-        
+    _evict_oldest(alert_counters, MAX_STREAMS)
+
     alert = alert_counters[payload.stream_id] >= 5
 
     drift_flag = False
     history = drift_history[payload.stream_id]
+    _evict_oldest(drift_history, MAX_STREAMS)
     if len(history) >= 100:  # rolling: evaluate continuously once window is full
         avg_confidence = sum(history) / len(history)
         if avg_confidence < 0.60:
@@ -383,6 +432,24 @@ async def temporal_audit(payload: TemporalAuditResult):
     
     return {"status": "ok"}
 
+@app.post("/aggregate", response_model=AggregatedResult, dependencies=[Depends(verify_api_key)])
+async def aggregate(payload: FramePayload):
+    return await process_frame_payload(payload)
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "aggregation-service", "uptime_s": int(time.time() - START_TIME)}
+    temporal_status = "unavailable"
+    if not os.getenv("TESTING"):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get("http://temporal-service:8004/health", timeout=2.0)
+                if resp.status_code == 200:
+                    temporal_status = "ok"
+        except Exception:
+            pass
+    return {
+        "status": "ok", 
+        "service": "aggregation-service", 
+        "uptime_s": int(time.time() - START_TIME),
+        "temporal_service_status": temporal_status
+    }

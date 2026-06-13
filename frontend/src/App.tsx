@@ -8,8 +8,8 @@ import './index.css';
 
 // Read URLs from Vite env vars (set in docker-compose or .env)
 // Fallback to localhost for local development outside Docker
-const CLIENT_ID = 'test_client';
-const CLIENT_SECRET = 'test_secret';
+const CLIENT_ID = import.meta.env.VITE_CLIENT_ID ?? 'test_client';
+const CLIENT_SECRET = import.meta.env.VITE_CLIENT_SECRET ?? 'test_secret';
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8003';
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8003/stream';
 
@@ -69,7 +69,7 @@ export default function App() {
       if (wsRef.current?.readyState === WebSocket.OPEN) return;
       if (maxRetriesExhausted.current) return;
 
-      const ws = new WebSocket(`${WS_URL}?token=${token}`);
+      const ws = new WebSocket(WS_URL, [token]);
 
       ws.onopen = () => {
         setConnected(true);

@@ -1,7 +1,6 @@
 import os
 import base64
 import time
-import hashlib
 import json
 import logging
 from typing import List, Optional, Tuple
@@ -19,6 +18,7 @@ app = FastAPI()
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
+START_TIME = time.time()
 
 # Predefined Threat Signatures from SCHEMA.md
 THREAT_SIGNATURES = [
@@ -51,32 +51,7 @@ THREAT_SIGNATURES = [
     }
 ]
 
-# Custom Deterministic Embedding model
-from langchain_core.embeddings import Embeddings
-
-class SimpleHashEmbeddings(Embeddings):
-    def __init__(self, dimension: int = 128):
-        self.dimension = dimension
-
-    def _embed(self, text: str) -> List[float]:
-        vec = [0.0] * self.dimension
-        words = text.lower().replace(",", " ").replace(".", " ").split()
-        if not words:
-            return vec
-        for word in words:
-            h = int(hashlib.md5(word.encode('utf-8')).hexdigest(), 16)
-            idx = h % self.dimension
-            vec[idx] += 1.0
-        norm = sum(x*x for x in vec) ** 0.5
-        if norm > 0:
-            vec = [x / norm for x in vec]
-        return vec
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [self._embed(t) for t in texts]
-
-    def embed_query(self, text: str) -> List[float]:
-        return self._embed(text)
+# Removed SimpleHashEmbeddings
 
 # Initialize vector store
 vector_store = None
@@ -87,8 +62,9 @@ def init_vector_store():
     try:
         from langchain_community.vectorstores import FAISS
         from langchain_core.documents import Document
-        
-        embeddings = SimpleHashEmbeddings()
+        from langchain_huggingface import HuggingFaceEmbeddings
+
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         documents = []
         for sig in THREAT_SIGNATURES:
             if not sig["active"]:
@@ -243,9 +219,6 @@ async def audit(req: AuditRequest):
         matched_signature=matched_sig,
         confidence=confidence
     )
-
-import time
-START_TIME = time.time()
 
 @app.get("/health")
 async def health():

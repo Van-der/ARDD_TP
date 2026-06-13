@@ -48,7 +48,7 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 | Temporal Service inference timeout (>5s) | Aggregation deadline exceeded | Return `temporal_verdict: "UNKNOWN"`, `low_confidence_flag: true` | Yes — MLflow |
 | Incomplete 20-frame buffer (stream drops early) | Buffer size `N < 20` at flush time | Zero-pad to 20 frames; set `low_confidence_flag: true`; continue inference | Yes — MLflow |
 | Extremely sparse buffer (`N < 6`) | Buffer size check before inference | Skip inference entirely; return `temporal_verdict: "UNKNOWN"` immediately | Yes — MLflow |
-| Frame gaps in window | Non-contiguous `frame_index` in buffer | Linearly interpolate missing frame tensors from adjacent neighbours; log `frames_interpolated` count | Yes — MLflow |
+| Frame gaps in window | Non-contiguous `frame_index` in buffer | **NOT IMPLEMENTED (deferred):** `frames_interpolated` always returns 0; gap detection not yet applied. Missing frames are silently absent from the buffer. Planned: linear interpolation from adjacent neighbours. | Yes — MLflow (placeholder) |
 | JPEG decode error | OpenCV decode failure on frame bytes | Drop frame from buffer; log `frame_decode_error`; continue buffering | Yes — service logs |
 | Pre-trained model weights missing | File load exception at startup | Fall back to random-initialised model; set `model_used: "random-fallback"` in result; log warning | Yes — service logs |
 | Redis buffer unavailable (Phase 3+) | Redis connection error | Fall back to in-memory Python deque (limited to last 20 items); log `redis_fallback` | Yes — MLflow |
@@ -58,6 +58,10 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 > **Aggregation Service state resets on restart.** The `alert_counters` dict (consecutive alert frames per stream) and the `drift_history` rolling window are held in process memory. A container restart (crash, redeploy, OOM kill) resets both to zero, potentially suppressing webhook alerts that would have fired within the same streak.
 >
 > **Mitigation (Phase 3):** Redis will replace in-memory dicts for both counters, making state persist across restarts and enabling multi-replica Aggregation Service deployments.
+
+> **Aggregation Service unbounded dict growth (FIXED 2026-06-14).** `alert_counters` and `drift_history` were plain `defaultdict` objects that grew indefinitely as unique `stream_id` values arrived (ingest-gateway generates a new `stream_id` per startup). Fixed: `_evict_oldest(d, cap=1000)` helper evicts the oldest half of keys when either dict exceeds 1000 entries.
+
+> **Linear interpolation not implemented.** `TemporalAuditResult.frames_interpolated` always returns 0. Frame-index gaps in the 20-frame buffer are not detected or compensated. Planned for a future sprint.
 
 ---
 

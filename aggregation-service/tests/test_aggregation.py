@@ -207,7 +207,7 @@ def test_aggregate_full_schema(mock_rag, mock_vision):
 # ── Integration: WebSocket auth (TESTING.md §3) ───────────────────────────────
 
 def test_websocket_no_token():
-    """WebSocket without JWT → server closes with code 1008 (TESTING.md §3)."""
+    """WebSocket without Sec-WebSocket-Protocol header → server closes with code 1008 (TESTING.md §3)."""
     from starlette.websockets import WebSocketDisconnect
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with client.websocket_connect("/stream") as ws:
@@ -215,28 +215,27 @@ def test_websocket_no_token():
     assert exc_info.value.code == 1008
 
 def test_websocket_invalid_token():
-    """WebSocket with invalid JWT → server closes connection (TESTING.md §3)."""
+    """WebSocket with invalid JWT in subprotocol → server closes connection (TESTING.md §3)."""
     with pytest.raises(Exception):
-        with client.websocket_connect("/stream?token=not.a.valid.token") as ws:
+        with client.websocket_connect("/stream", headers={"Sec-WebSocket-Protocol": "not.a.valid.token"}) as ws:
             ws.receive_text()
 
 def test_websocket_expired_token():
-    """WebSocket with expired JWT → server closes connection (TESTING.md §3)."""
+    """WebSocket with expired JWT in subprotocol → server closes connection (TESTING.md §3)."""
     expired_token = jwt.encode(
         {"sub": "test", "exp": int(time.time()) - 3600},
         JWT_SECRET,
         algorithm="HS256"
     )
     with pytest.raises(Exception):
-        with client.websocket_connect(f"/stream?token={expired_token}") as ws:
+        with client.websocket_connect("/stream", headers={"Sec-WebSocket-Protocol": expired_token}) as ws:
             ws.receive_text()
 
 def test_websocket_valid_token_connects():
-    """WebSocket with valid JWT → connection accepted (TESTING.md §3)."""
+    """WebSocket with valid JWT via subprotocol → connection accepted (TESTING.md §3)."""
     r = client.post("/auth/token", json={"client_id": "c", "client_secret": "s"})
     token = r.json()["access_token"]
-    with client.websocket_connect(f"/stream?token={token}") as ws:
-        # Connection established — just verify we can sit here
+    with client.websocket_connect("/stream", headers={"Sec-WebSocket-Protocol": token}) as ws:
         assert ws is not None
 
 
@@ -252,7 +251,7 @@ def test_vision_error_broadcasts_pipeline_error(mock_vision):
 
     # Connect WebSocket, fire aggregate in same thread (TestClient is sync)
     received_events = []
-    with client.websocket_connect(f"/stream?token={token}") as ws:
+    with client.websocket_connect("/stream", headers={"Sec-WebSocket-Protocol": token}) as ws:
         # Use a thread to call /aggregate while the WS is open
         import threading
         barrier = threading.Event()

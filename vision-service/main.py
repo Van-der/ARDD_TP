@@ -41,7 +41,7 @@ spatial_branch.eval()
 MODEL_WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "/app/weights/efficientnet_b4.pth")
 if os.path.exists(MODEL_WEIGHTS_PATH):
     try:
-        spatial_branch.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=device))
+        spatial_branch.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=device, weights_only=True))
         print(f"Loaded trained weights from {MODEL_WEIGHTS_PATH}")
     except Exception as e:
         print(f"Failed to load weights from {MODEL_WEIGHTS_PATH}, falling back to ImageNet: {e}")
