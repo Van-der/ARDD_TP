@@ -7,20 +7,31 @@ sequenceDiagram
     participant Source as Video Stream
     participant Gateway as Ingest Gateway
     participant Kafka as Kafka Broker
-    participant Vision as Vision Service (PyTorch)
-    participant RAG as Context Agent (LangChain)
     participant Agg as Aggregation Service
+    participant Temporal as Temporal Service (ResNext50+LSTM)
+    participant Vision as Vision Service (EfficientNet+FFT)
+    participant RAG as Context Agent (LangChain)
     participant MLflow as MLflow Registry
     participant UI as React Dashboard
 
     Source->>Gateway: Push live video feed (RTSP/HTTP)
-    Gateway->>Kafka: Publish Frame Payload (frame topic)
-    Kafka->>Vision: Consume & process tensor
-    Vision-->>Agg: Return inference scores
-    Agg->>RAG: Request contextual verification (sequential)
-    RAG-->>Agg: Return audit verdict
-    Agg->>MLflow: Log telemetry & metrics
-    Agg->>UI: Push aggregated state via WebSocket
+    Gateway->>Kafka: Publish FramePayload (frames topic)
+
+    par Speed Layer (200ms SLA)
+        Kafka->>Agg: aiokafka consumer (frames topic)
+        Agg->>Vision: HTTP POST /infer (per frame)
+        Vision-->>Agg: VisionResult (deepfake_score)
+        Agg->>RAG: HTTP POST /audit (sequential)
+        RAG-->>Agg: RAGAuditVerdict
+        Agg->>MLflow: Log telemetry per frame
+        Agg->>UI: Push AggregatedResult via WebSocket
+    and Batch Layer (~0.67s cycle)
+        Kafka->>Temporal: aiokafka consumer (frames topic, temporal-service-group)
+        Note over Temporal: deque(maxlen=20) per stream_id<br/>tumbling window — flush every 20 frames
+        Temporal->>Temporal: ResNext50+LSTM inference on [1,20,3,112,112]
+        Temporal->>Agg: HTTP POST /temporal_audit (TemporalAuditResult)
+        Agg->>UI: Push temporal report via WebSocket (Audit Panel)
+    end
 ```
 
 ## 2. Ingest Gateway
@@ -33,17 +44,28 @@ The Ingest Gateway is the entry point for all video data into the system.
 
 ## 3. Execution Flow
 
+**Speed Layer (per frame, 200ms SLA):**
+
 1. External source pushes a live video feed to the Ingest Gateway.
-2. Gateway chunks video into discrete frames and publishes them to the Kafka `frames` topic.
-3. Vision Service consumes the frame, runs MTCNN alignment, and executes the dual-branch model.
-4. Vision Service result is forwarded to the Aggregation Service.
-5. Aggregation Service calls the RAG Context Agent to verify the vision result against known threat signatures.
-6. Aggregation Service merges the vision score and contextual verdict into a single `AggregatedResult` payload.
-7. Telemetry data (latency, scores, drift flag) is pushed to the MLflow server.
-8. Aggregated payload is broadcast over WebSockets to the React frontend.
+2. Gateway chunks video into discrete frames and publishes `FramePayload` to the Kafka `frames` topic.
+3. Aggregation Service aiokafka consumer receives the frame and calls Vision Service via `HTTP POST /infer`.
+4. Vision Service runs MTCNN alignment and EfficientNet-B4 + FFT dual-branch model, returns `VisionResult`.
+5. Aggregation Service calls RAG Context Agent sequentially with the vision score.
+6. Aggregation merges vision score and RAG verdict into a single `AggregatedResult`.
+7. Telemetry (latency, scores, drift flag) pushed to MLflow.
+8. `AggregatedResult` broadcast over WebSocket to React frontend (Live Ticker panel).
 9. Zustand updates UI state, rendering real-time graphs and compliance alerts.
 
-> **Architecture note:** Vision and RAG run **sequentially** — RAG receives the Vision score as input context, enabling the audit to be conditioned on the model's output. RAG must complete within **100ms** to leave headroom for Vision (~80ms p95) and Aggregation overhead (~20ms) within the 200ms end-to-end SLA.
+**Batch Layer (every ~0.67s / 20 frames):**
+
+1. Temporal Service aiokafka consumer (consumer group `temporal-service-group`) independently receives the same `FramePayload` from the `frames` topic.
+2. Each JPEG decoded to 112×112 RGB, ImageNet-normalised, appended to a `deque(maxlen=20)` keyed by `stream_id`.
+3. When deque reaches 20 frames, tensor `[1, 20, 3, 112, 112]` is built and passed to ResNext50+LSTM.
+4. `temporal_score = F.softmax(logits, dim=1)[0][0].item()` (fake class probability).
+5. `TemporalAuditResult` POSTed to Aggregation Service `POST /temporal_audit`.
+6. Aggregation forwards result to WebSocket broadcast (Dashboard Audit Panel). Deque is cleared (tumbling window).
+
+> **Architecture note:** Speed and Batch layers run in parallel as independent aiokafka consumer tasks. Vision and RAG run **sequentially** within the Speed Layer — RAG must complete within **100ms** to stay inside the 200ms end-to-end SLA.
 
 ## 4. Aggregation Service
 

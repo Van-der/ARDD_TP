@@ -10,8 +10,8 @@
 | Message Broker | Apache Kafka |
 | Ingest Gateway | Python (OpenCV, FFmpeg) |
 | **Speed Layer** — Vision Service | PyTorch, FastAPI (EfficientNet-B4 + FFT dual-branch) |
-| **Batch Layer** — Temporal Service | PyTorch (Pre-trained LSTM / ViT, DFDC weights), FastAPI |
-| Feature Buffer (Batch Layer) | In-memory Python deque / Redis |
+| **Batch Layer** — Temporal Service | PyTorch (ResNext50+LSTM — `Naman712/Deep-fake-detection`), `aiokafka`, FastAPI |
+| Frame Buffer (Batch Layer) | In-memory `deque(maxlen=20)` per stream; Redis in Phase 3 |
 | RAG / Context Service | LangChain, FAISS/ChromaDB, Ollama/Mistral |
 | Aggregation Service | Python, FastAPI |
 | MLOps & Telemetry | MLflow |
@@ -37,14 +37,14 @@
 | Aggregation merge + emit | ≤ 20ms |
 | **Total (Speed Layer)** | **≤ 200ms** |
 
-### Batch Layer SLA (per 30-second window)
+### Batch Layer SLA (per 20-frame tumbling window)
 
 | Step | Budget |
 |---|---|
-| Feature vector buffer fill (continuous Kafka consume) | Ongoing |
-| LSTM / ViT sequence inference on `[900, 1024]` tensor | ≤ 5s |
-| Temporal result POST to Aggregation + WebSocket emit | ≤ 500ms |
-| **Total (Batch Layer)** | **Best-effort, ≤ 30s cycle** |
+| Frame buffer fill (20 JPEG frames, continuous aiokafka consume) | ~0.67s at 30 FPS |
+| ResNext50+LSTM inference on `[1, 20, 3, 112, 112]` tensor | ≤ 2s |
+| Temporal result POST to Aggregation + WebSocket emit | ≤ 200ms |
+| **Total (Batch Layer)** | **Best-effort, ~0.67s cycle** |
 
 > The Batch Layer operates independently of the Speed Layer. A Temporal Service timeout or crash does **not** affect Speed Layer SLA.
 
@@ -96,67 +96,32 @@ Where:
 
 An `alert: true` flag is set on `AggregatedResult` when `final_score > 0.90` for **5 or more consecutive frames** on the same `stream_id`.
 
-### 4b. Temporal Score (LSTM / ViT Sequence Model, Batch Layer) — *Phase 2*
+### 4b. Temporal Score (ResNext50+LSTM, Batch Layer) — *Phase 2*
 
-The Temporal Service accumulates `feature_vector` payloads over a **30-second sliding window** (900 vectors at 30 FPS) and runs a pre-trained sequence model:
+The Temporal Service consumes raw JPEG frames from the Kafka `frames` topic (consumer group `temporal-service-group`) and runs a pre-trained ResNext50+LSTM model on 20-frame tumbling windows:
 
 ```
-temporal_sequence = stack(feature_vectors[-900:])          # shape: [900, 1024]
-temporal_score    = lstm_or_vit_model(temporal_sequence)   # float in [0.0, 1.0]
+frames_tensor = stack([decode_and_norm(f) for f in deque[-20:]])  # shape: [1, 20, 3, 112, 112]
+logits        = resnext50_lstm_model(frames_tensor)
+temporal_score = F.softmax(logits, dim=1)[0][0].item()            # fake class probability
 ```
 
-**Temporal Model Strategy:**
-- **Pre-trained models:** Drop-in weights are available from open-source repositories (e.g., Hazem020/DeepFake-Detection, saanikagupta/Deepfake-Detection-Challenge, TimeSformer/ViT fine-tuned on Celeb-DF, LipForensics).
-- **Training the LSTM Head:** Because the Speed Layer handles heavy feature extraction (reducing 3D video to 1024-d vectors), the Temporal Service LSTM head is tiny (roughly 2 to 5 million parameters). It can be trained on a single consumer GPU in a matter of hours using a subset of the FaceForensics++ dataset.
-
-**Batch Layer Implementation Blueprint (PyTorch):**
-```python
-import torch
-import torch.nn as nn
-
-class TemporalBatchAuditor(nn.Module):
-    def __init__(self, feature_dim=1024, hidden_dim=256, lstm_layers=2):
-        super(TemporalBatchAuditor, self).__init__()
-        
-        # The LSTM takes the 1024D vector from your Kafka buffer
-        # batch_first=True means we expect input shape: (batch_size, sequence_length, features)
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=hidden_dim,
-            num_layers=lstm_layers,
-            batch_first=True,
-            dropout=0.3
-        )
-        
-        # The final decision layer
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x shape from Kafka Buffer: (1, 900, 1024) -> 1 stream, 30 secs at 30fps, 1024 features
-        lstm_out, (hidden_state, cell_state) = self.lstm(x)
-        
-        # We only care about the very last output of the LSTM sequence 
-        # (what it concluded after watching all 900 frames)
-        final_temporal_state = lstm_out[:, -1, :] 
-        
-        # Pass it to the classifier to get the final deepfake probability
-        verdict = self.classifier(final_temporal_state)
-        return verdict
-```
+**Model:** `Naman712/Deep-fake-detection` — `model_87_acc_20_frames_final_data.pt`
+- Architecture: ResNext50 backbone (layers `model.0`–`model.7`) + LSTM (`lstm.weight_ih_l0`, `lstm.weight_hh_l0`) + linear head (`linear1.weight`)
+- Input: `[1, 20, 3, 112, 112]`, ImageNet normalised (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`)
+- Output: `softmax(logits)[0][0]` = fake class probability → `[0.0, 1.0]`
+- Accuracy: 87% on 20-frame evaluation set
 
 **Buffer resilience rules:**
 
 | Condition | Action |
 |---|---|
-| Buffer has `N < 900` vectors (incomplete window) | Zero-pad tensor to `[900, 1024]`; set `low_confidence_flag: true` |
-| `N < 300` vectors (`window_duration_s < 10`) | Return `temporal_verdict: "UNKNOWN"` immediately without running inference |
-| Frame gap detected (non-contiguous `frame_index`) | Linearly interpolate missing vectors from adjacent neighbours |
+| Buffer has `N < 20` frames (incomplete window) | Zero-pad tensor to 20 frames; set `low_confidence_flag: true` |
+| `N < 6` frames | Return `temporal_verdict: "UNKNOWN"` immediately without running inference |
+| Frame gap detected (non-contiguous `frame_index`) | Linearly interpolate missing frame tensors from adjacent neighbours; log `frames_interpolated` |
+| Model weights file missing | Fall back to random-initialised model; set `model_used: "random-fallback"` |
+
+> **Note:** The `feature_vector` field in `VisionResult` (EfficientNet-B4 penultimate layer) is retained in the schema for future use but is not consumed by Phase 2 Temporal Service, which has its own ResNext50 feature extractor. See `ARCHITECTURE.md` Vision Service note.
 
 **`temporal_verdict` mapping:**
 
@@ -202,7 +167,7 @@ Key current-phase behaviours:
 
 > Items below are **not** part of the v1.0.0 implementation. See `ROADMAP.md` for phasing.
 
-- **Temporal Batch Service (Phase 2):** LSTM/ViT sequence model on 30-second feature-vector windows.
+- **Temporal Batch Service (Phase 2):** ResNext50+LSTM on 20-frame tumbling windows (~0.67s cycle). *In progress.*
 - **gRPC transport (Phase 3):** Replace REST between Kafka Consumer ↔ Vision Service to reduce serialization overhead.
 - **Horizontal Vision scaling (Phase 3):** Multiple Vision Service replicas behind a load balancer.
 - **ChromaDB persistent store (Phase 3):** Replace in-memory FAISS with persistent ChromaDB.

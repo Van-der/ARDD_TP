@@ -118,6 +118,7 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_LABELS=labels
       - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - WEBHOOK_TOKEN=${WEBHOOK_TOKEN:-}
     networks:
       - ardd_net
     restart: unless-stopped
@@ -128,7 +129,7 @@ services:
       retries: 3
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:2.11.1
+    image: ghcr.io/mlflow/mlflow:v2.11.1
     container_name: mlflow
     command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow-artifacts
     ports:
@@ -147,7 +148,7 @@ services:
       retries: 3
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.1.32
     container_name: ollama
     ports:
       - "11434:11434"

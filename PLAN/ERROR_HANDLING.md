@@ -46,12 +46,18 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 |---|---|---|---|
 | Temporal Service crash / unavailable | HTTP connection error from Aggregation | Speed Layer continues unaffected; Dashboard Audit Panel shows **"Temporal Audit Unavailable — Relying on Spatial heuristics"** | Yes — MLflow `temporal_unavailable` flag |
 | Temporal Service inference timeout (>5s) | Aggregation deadline exceeded | Return `temporal_verdict: "UNKNOWN"`, `low_confidence_flag: true` | Yes — MLflow |
-| Incomplete 30-second buffer (stream drops early) | Buffer size `N < 900` at flush time | Zero-pad tensor to `[900, 1024]`; set `low_confidence_flag: true`; continue inference | Yes — MLflow |
-| Extremely incomplete buffer (`N < 300`, <10s of data) | Buffer size check before inference | Skip inference entirely; return `temporal_verdict: "UNKNOWN"` immediately | Yes — MLflow |
-| Frame gaps in 30-second window | Non-contiguous `frame_index` in buffer | Linearly interpolate missing feature vectors from adjacent neighbours; log `frames_interpolated` count | Yes — MLflow |
-| Feature vector decode error | Base64 / numpy deserialization failure | Drop vector from buffer; log `vector_decode_error`; continue buffering | Yes — service logs |
-| Pre-trained model weights missing | File load exception at startup | Service fails to start; Docker Compose restart policy triggers; Dashboard shows "Temporal Audit Unavailable" | Yes — service logs |
-| Redis buffer unavailable (Phase 2+) | Redis connection error | Fall back to in-memory Python deque (limited to last 900 items); log `redis_fallback` | Yes — MLflow |
+| Incomplete 20-frame buffer (stream drops early) | Buffer size `N < 20` at flush time | Zero-pad to 20 frames; set `low_confidence_flag: true`; continue inference | Yes — MLflow |
+| Extremely sparse buffer (`N < 6`) | Buffer size check before inference | Skip inference entirely; return `temporal_verdict: "UNKNOWN"` immediately | Yes — MLflow |
+| Frame gaps in window | Non-contiguous `frame_index` in buffer | Linearly interpolate missing frame tensors from adjacent neighbours; log `frames_interpolated` count | Yes — MLflow |
+| JPEG decode error | OpenCV decode failure on frame bytes | Drop frame from buffer; log `frame_decode_error`; continue buffering | Yes — service logs |
+| Pre-trained model weights missing | File load exception at startup | Fall back to random-initialised model; set `model_used: "random-fallback"` in result; log warning | Yes — service logs |
+| Redis buffer unavailable (Phase 3+) | Redis connection error | Fall back to in-memory Python deque (limited to last 20 items); log `redis_fallback` | Yes — MLflow |
+
+### Known Limitations
+
+> **Aggregation Service state resets on restart.** The `alert_counters` dict (consecutive alert frames per stream) and the `drift_history` rolling window are held in process memory. A container restart (crash, redeploy, OOM kill) resets both to zero, potentially suppressing webhook alerts that would have fired within the same streak.
+>
+> **Mitigation (Phase 3):** Redis will replace in-memory dicts for both counters, making state persist across restarts and enabling multi-replica Aggregation Service deployments.
 
 ---
 
@@ -59,7 +65,7 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 
 | Scenario | Detection | Response | Logged |
 |---|---|---|---|
-| Timeout (>150ms) | Aggregation Service deadline exceeded | Aggregation resolves with Vision score only; `audit_verdict: "UNKNOWN"`, `rag_used: false` | Yes — MLflow |
+| Timeout (>100ms) | Aggregation Service deadline exceeded | Aggregation resolves with Vision score only; `audit_verdict: "UNKNOWN"`, `rag_used: false` | Yes — MLflow |
 | No matching signature | FAISS/ChromaDB returns empty result | Return `audit_verdict: "UNKNOWN"`, `matched_signature: null` | No |
 | LLM (Ollama) unavailable | HTTP connection error | Return `503 Service Unavailable`; treated as timeout by Aggregation Service | Yes — service logs |
 | Unidentifiable input | Guardrail triggered | Return `audit_verdict: "UNKNOWN"`, `confidence: 0.0` | Yes — MLflow |
@@ -74,7 +80,7 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 |---|---|---|---|
 | Vision Service unavailable | HTTP connection error | Drop frame; emit `pipeline_error` to WebSocket | Yes — MLflow |
 | Vision Service returns 500 | HTTP 500 response | Drop frame; emit `pipeline_error` to WebSocket | Yes — MLflow |
-| RAG timeout | Deadline exceeded (150ms) | Resolve with Vision score only (`rag_used: false`) | Yes — MLflow |
+| RAG timeout | Deadline exceeded (100ms) | Resolve with Vision score only (`rag_used: false`) | Yes — MLflow |
 | Consecutive high-score frames (≥5, score >0.90) | Rolling window counter | Trigger webhook alert; archive stream segment | Yes — MLflow `alert: true` |
 | Drift detected | MLflow moving average <60% confidence | Flag model weights for retraining | Yes — MLflow `drift_flag: true` |
 | MLflow unavailable | HTTP connection error on log call | Buffer up to 100 telemetry entries in memory; retry flush every 10s | Yes — local buffer |

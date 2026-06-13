@@ -1,0 +1,12 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+dist-ssr/
+.git/
+temp/
+tmp/
+*.log

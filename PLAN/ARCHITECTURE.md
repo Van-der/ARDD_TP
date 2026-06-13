@@ -19,9 +19,9 @@
 │  ┌──────────────────────┐    ┌──────────────────────┐                       │
 │  │     SPEED LAYER      │    │     BATCH LAYER      │                       │
 │  │   (Vision Service)   │    │  (Temporal Service)  │                       │
-│  │ - Frame-by-frame     │    │ - 30-sec feature buf │                       │
+│  │ - Frame-by-frame     │    │ - 20-frame tumbling  │                       │
 │  │ - EfficientNet + FFT │    │ - Sequence analysis  │                       │
-│  │ - 200ms SLA          │    │ - LSTM / ViT Model   │                       │
+│  │ - 200ms SLA          │    │ - ResNext50+LSTM      │                       │
 │  └──────────┬───────────┘    └──────────┬───────────┘                       │
 │             │                           │                                   │
 │             ▼                           ▼                                   │
@@ -36,7 +36,7 @@
 │                             ┌──────────────┐                               │
 │                             │  Live Ticker │ ← frame scores (200ms)        │
 │                             ├──────────────┤                               │
-│                             │  Audit Panel │ ← temporal report (30s)       │
+│                             │  Audit Panel │ ← temporal report (~0.67s)    │
 │                             └──────────────┘                               │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -50,11 +50,11 @@ ARDD-TP implements a **Lambda Architecture** — a data processing pattern that 
 | | Speed Layer | Batch Layer |
 |---|---|---|
 | **Service** | Vision Service | Temporal Service |
-| **Trigger** | Every frame (~33ms at 30 FPS) | Every 30 seconds (900 frames) |
-| **Input** | Raw JPEG frame | 1024-d feature vectors from Vision Service |
-| **Model** | EfficientNet-B4 + FFT | Pre-trained LSTM / ViT (DFDC weights) |
-| **Output** | `deepfake_score` + `feature_vector` | `temporal_score` + `temporal_verdict` |
-| **SLA** | 200ms end-to-end | Best-effort, 30s cycle |
+| **Trigger** | Every frame (~33ms at 30 FPS) | Every 20 frames (~0.67s at 30 FPS) |
+| **Input** | Raw JPEG frame (from `frames` topic) | Raw JPEG frame (from `frames` topic, separate consumer group) |
+| **Model** | EfficientNet-B4 + FFT | ResNext50+LSTM (`Naman712/Deep-fake-detection`) |
+| **Output** | `deepfake_score` | `temporal_score` + `temporal_verdict` |
+| **SLA** | 200ms end-to-end | Best-effort, ~0.67s cycle |
 | **Failure impact** | Blocks live dashboard | Dashboard audit panel degrades gracefully |
 
 Both layers feed into the **Aggregation Service**, which merges results and pushes to MLflow and the React Dashboard via WebSocket.
@@ -77,18 +77,24 @@ Both layers feed into the **Aggregation Service**, which merges results and push
 - **Role:** Runs MTCNN face alignment and EfficientNet-B4 + FFT dual-branch inference on each frame.
 - **Tech:** PyTorch, FastAPI.
 - **Input:** `FramePayload` via HTTP POST from Aggregation Service.
-- **Output:** `VisionResult` — including `deepfake_score` **and** `feature_vector` (1024-d).
-- **Note:** The `feature_vector` is the flattened tensor from the penultimate EfficientNet-B4 layer, before the final classifier head. It is published back to Kafka for the Temporal Service to consume (Phase 2).
+- **Output:** `VisionResult` — `deepfake_score`, `feature_vector` (1024-d, reserved for future use).
+- **Note:** `feature_vector` is the flattened EfficientNet-B4 penultimate-layer tensor. Not consumed by Phase 2 Temporal Service (which uses its own ResNext50 extractor). Retained in the schema for Phase 3+ extensibility.
 
 ### Temporal Service (Batch Layer) — *Phase 2*
-- **Role:** Accumulates 1024-d feature vectors over a 30-second sliding window. Runs a pre-trained sequence model (LSTM or ViT) to detect temporal anomalies: micro-jitters, unnatural blinking, audio-visual desynchronization.
-- **Tech:** PyTorch (pre-trained DFDC LSTM/ViT weights), Python deque / Redis.
-- **Input:** `feature_vector` payloads from Kafka `frames` topic (decoded from `VisionResult`).
-- **Buffer:** 900 vectors × 1024 floats = ~3.6 MB per stream (negligible vs. raw frame buffering).
-- **Output:** `TemporalAuditResult` every 30 seconds → HTTP POST to Aggregation Service.
-- **Fallback on incomplete buffer:** Zero-pads tensor to `[900, 1024]`, sets `low_confidence_flag: true`.
-- **Fallback on frame gaps:** Linearly interpolates missing feature vectors from adjacent neighbours.
+- **Role:** Runs a pre-trained ResNext50+LSTM sequence model on 20-frame tumbling windows (~0.67s at 30 FPS) to detect temporal anomalies: micro-jitters, unnatural blinking, identity inconsistency across frames.
+- **Tech:** PyTorch (ResNext50+LSTM — `Naman712/Deep-fake-detection`, 87% accuracy), `aiokafka`, FastAPI.
+- **Input:** Raw `FramePayload` from Kafka `frames` topic (same topic as Vision Service, separate consumer group `temporal-service-group`).
+- **Preprocessing:** Each JPEG decoded to 112×112 RGB, ImageNet normalised (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`), stacked into `[1, 20, 3, 112, 112]` tensor.
+- **Buffer:** `deque(maxlen=20)` per `stream_id`; tumbling window — cleared after each inference. ~11 MB per stream at full buffer (20 × 112×112×3 float32).
+- **Score mapping:** `temporal_score = F.softmax(logits, dim=1)[0][0].item()` — fake class probability → `[0.0, 1.0]`.
+- **Output:** `TemporalAuditResult` every ~0.67s → HTTP POST to Aggregation Service `POST /temporal_audit`.
+- **Fallback on incomplete buffer:** Zero-pads to 20 frames, sets `low_confidence_flag: true`.
+- **Fallback on sparse buffer (`N < 6`):** Returns `temporal_verdict: "UNKNOWN"` without running inference.
+- **Fallback on missing weights:** Uses random-initialised model; sets `model_used: "random-fallback"`.
+- **Fallback on frame gaps:** Linearly interpolates missing tensors from adjacent neighbours; logs `frames_interpolated` count.
 - **Port:** 8004.
+
+> **Future scope:** Sliding window (overlapping inference every K frames) planned once tumbling baseline is stable.
 
 ### RAG Context Agent
 - **Role:** Semantic search against known threat signatures, conditioned on the Vision score.
@@ -97,8 +103,8 @@ Both layers feed into the **Aggregation Service**, which merges results and push
 
 ### Aggregation Service
 - **Role:** Orchestrates two independent result streams:
-  1. **Speed path:** Vision result → RAG → live `AggregatedResult` (200ms SLA).
-  2. **Batch path:** Temporal result → periodic `TemporalAuditResult` merge every 30 seconds.
+  1. **Speed path:** aiokafka consumer on `frames` → Vision HTTP → RAG → live `AggregatedResult` (200ms SLA).
+  2. **Batch path:** Temporal Service POSTs `TemporalAuditResult` every ~0.67s → merge into next broadcast.
 - **Tech:** Python, FastAPI.
 - **Output:** Emits to MLflow and WebSocket broadcaster.
 - **RAG timeout budget:** 100ms.
@@ -108,13 +114,13 @@ Both layers feed into the **Aggregation Service**, which merges results and push
 - **Drift trigger:** Flags model for retraining when confidence moving average drops below 60%.
 
 ### WebSocket Broadcaster
-- **Role:** Pushes both live `AggregatedResult` (every frame) and periodic `TemporalAuditResult` (every 30s) to connected React clients.
+- **Role:** Pushes both live `AggregatedResult` (every frame) and periodic `TemporalAuditResult` (every ~0.67s) to connected React clients.
 - **Resilience:** Clients reconnect with exponential backoff; stale-data banner shown on disconnect.
 
 ### React Dashboard
 - **Role:** Renders two panels:
   1. **Live Ticker** — real-time frame-by-frame deepfake scores (Speed Layer).
-  2. **Audit Panel** — periodic 30-second temporal analysis report (Batch Layer): "Temporal Analysis: 98% Natural Continuity. No micro-jitters detected."
+  2. **Audit Panel** — periodic ~0.67s temporal analysis report (Batch Layer, 20-frame window): "Temporal Analysis: 98% Natural Continuity. No micro-jitters detected."
 - **Tech:** React, TypeScript, Zustand.
 
 ---
@@ -122,18 +128,23 @@ Both layers feed into the **Aggregation Service**, which merges results and push
 ## 4. Data Flow Summary
 
 ```
-FramePayload
+Kafka `frames` topic
     │
-    ├──▶ Vision Service ──▶ VisionResult ──▶ Aggregation ──▶ RAG ──▶ AggregatedResult
-    │                             │                                         │
-    │                        feature_vector ─── Kafka ──▶ Temporal Service  │
-    │                                                          │             │
-    │                                              TemporalAuditResult       │
-    │                                                          │             │
-    └──────────────────────────────────────────── Aggregation ◀─────────────┘
-                                                       │
-                                          ┌────────────┴───────────┐
-                                       [MLflow]           [WebSocket → Dashboard]
+    ├──▶ Aggregation Service (aiokafka consumer)
+    │         │
+    │         ▼
+    │    Vision Service (HTTP /infer) ──▶ VisionResult
+    │         │
+    │         ▼
+    │    RAG Agent (HTTP /audit) ──▶ AggregatedResult ──▶ [MLflow + WebSocket]
+    │
+    └──▶ Temporal Service (aiokafka consumer, group: temporal-service-group)
+              │  deque(maxlen=20) per stream_id
+              ▼
+         ResNext50+LSTM inference (every 20 frames)
+              │
+              ▼
+         HTTP POST /temporal_audit ──▶ Aggregation Service ──▶ [WebSocket → Dashboard]
 ```
 
 ---

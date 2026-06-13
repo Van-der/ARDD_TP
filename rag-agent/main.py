@@ -244,6 +244,9 @@ async def audit(req: AuditRequest):
         confidence=confidence
     )
 
+import time
+START_TIME = time.time()
+
 @app.get("/health")
 async def health():
     if not vector_store_initialized:
@@ -251,5 +254,5 @@ async def health():
     return {
         "status": "ok",
         "service": "rag-agent",
-        "uptime_s": 0
+        "uptime_s": int(time.time() - START_TIME)
     }

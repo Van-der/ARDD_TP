@@ -27,6 +27,7 @@ RAG_URL = os.getenv("RAG_URL", "http://rag-agent:8002/audit")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 RAG_TIMEOUT = 0.100  # 100ms
 
 # Setup MLflow
@@ -332,11 +333,13 @@ async def aggregate(payload: FramePayload):
     # Webhook alert delivery (3 attempts with backoff) — SCHEMA.md §8
     if alert and WEBHOOK_URL:
         webhook_payload = {
-            "event": "deepfake_alert",
+            "event": "DEEPFAKE_ALERT",
             "stream_id": payload.stream_id,
             "frame_index": payload.frame_index,
             "final_score": final_score,
             "audit_verdict": audit_verdict,
+            "matched_signature": matched_signature,
+            "consecutive_alert_frames": alert_counters[payload.stream_id],
             "timestamp_ms": payload.timestamp_ms
         }
         asyncio.create_task(_deliver_webhook(webhook_payload))
@@ -349,7 +352,8 @@ async def _deliver_webhook(payload: dict, max_attempts: int = 3) -> None:
     for attempt in range(1, max_attempts + 1):
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(WEBHOOK_URL, json=payload, timeout=5.0)
+                headers = {"Authorization": f"Bearer {WEBHOOK_TOKEN}"} if WEBHOOK_TOKEN else {}
+                resp = await client.post(WEBHOOK_URL, json=payload, headers=headers, timeout=5.0)
                 resp.raise_for_status()
                 logger.info(f"Webhook delivered on attempt {attempt}")
                 return

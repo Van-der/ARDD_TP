@@ -33,7 +33,7 @@ ARDD-TP is a real-time media verification system. It processes live video stream
 These are active requirements in v1.0.0:
 
 - **Graceful Degradation:** If stream throughput exceeds processing capacity, frame extraction dynamically downsamples from 30 FPS to 5 FPS to maintain real-time telemetry within the 200ms SLA.
-- **RAG Timeout Fallback:** If the RAG Context Agent exceeds 150ms, the Aggregation Service resolves using the Vision score alone (`audit_verdict: "UNKNOWN"`).
+- **RAG Timeout Fallback:** If the RAG Context Agent exceeds 100ms, the Aggregation Service resolves using the Vision score alone (`audit_verdict: "UNKNOWN"`).
 - **Threat Escalation:** If `final_score > 0.90` for five consecutive frames, a high-priority webhook alert is triggered and the stream segment is archived for manual review.
 - **Drift Detection:** If the rolling average confidence drops below 60%, the model is flagged for retraining.
 - **Face Alignment Bypass:** If MTCNN fails, inference is skipped and a neutral score (0.5) is returned.

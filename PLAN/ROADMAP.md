@@ -1,6 +1,6 @@
 # Roadmap
 
-## Phase 1 — Core Pipeline MVP (v1.0.0) ✅ In Progress
+## Phase 1 — Core Pipeline MVP (v1.0.0) ✅ Done
 
 The baseline system as specified in `PRD.md` and `TRD.md`.
 
@@ -11,9 +11,9 @@ The baseline system as specified in `PRD.md` and `TRD.md`.
 | Vision Service (EfficientNet-B4 + FFT) | ✅ Done | MTCNN alignment, FastAPI endpoint |
 | RAG Context Agent (LangChain + FAISS) | ✅ Done | Ollama/Mistral, 100ms timeout budget |
 | Aggregation Service | ✅ Done | Sequential Vision → RAG, fallback logic |
-| MLflow telemetry logging | ⏳ Next | Per-frame scores, drift detection |
+| MLflow telemetry logging | ✅ Done | Per-frame scores, drift detection |
 | WebSocket broadcaster | ✅ Done | Real-time push to React dashboard |
-| React dashboard (Zustand) | Planned | Live graphs, compliance alerts, stale-data banner |
+| React dashboard (Zustand) | ✅ Done | Live graphs, compliance alerts, stale-data banner |
 | Docker Compose deployment | ✅ Done | All services with auto-restart policies |
 
 ---
@@ -24,17 +24,17 @@ Introduces the **Batch Layer** alongside the existing Speed Layer, forming a tru
 
 ### Architecture Upgrade
 
-The system evolves from a simple sequential pipeline to a **split-stream Lambda pipeline**:
+The system evolves from a simple sequential pipeline to a **split-stream Lambda pipeline**. Both layers independently consume from the same Kafka `frames` topic:
 
 ```
              ┌──────────────────────────────────┐
-             │           Kafka Broker            │
+             │    Kafka `frames` topic           │
              └──────────┬───────────────┬────────┘
                         │               │
              ┌──────────▼──┐     ┌──────▼──────────┐
              │Speed Layer  │     │  Batch Layer     │
              │(Vision Svc) │     │ (Temporal Svc)   │
-             │ 200ms SLA   │     │  30s audit cycle │
+             │ 200ms SLA   │     │ ~0.67s cycle     │
              └──────────┬──┘     └──────┬───────────┘
                         │               │
              ┌──────────▼───────────────▼────────┐
@@ -42,40 +42,45 @@ The system evolves from a simple sequential pipeline to a **split-stream Lambda 
              └────────────────────────────────────┘
 ```
 
+### Temporal Service Design
+
+- **Model:** ResNext50+LSTM — `Naman712/Deep-fake-detection` (87% acc), weights in `temporal-service/`
+- **Input:** 20 raw JPEG frames → decode to 112×112 RGB → ImageNet norm → `[1, 20, 3, 112, 112]` tensor
+- **Window:** 20-frame tumbling (deque cleared after each inference) — ~0.67s at 30 FPS
+- **Score:** `temporal_score = F.softmax(logits, dim=1)[0][0].item()` (fake class probability)
+- **Consumer group:** `temporal-service-group` (separate from Aggregation Service consumer)
+
+> **Future scope:** Sliding window (overlapping inference every K frames) planned once tumbling baseline is stable.
+
 ### Implementation Steps (strict order)
 
 | Step | Task | Notes |
 |---|---|---|
-| 2.1 | **Modify Vision Service** — extract and expose `feature_vector` | Flattened 1024-d tensor from penultimate EfficientNet-B4 layer; included in `VisionResult`; base64-encoded for Kafka |
-| 2.2 | **Update Kafka schema** — `VisionResult` gains `feature_vector` field | `numpy.float32.tobytes()` → base64; Temporal consumer decodes with `numpy.frombuffer()` |
-| 2.3 | **Build Temporal Service** — Kafka consumer + in-memory feature buffer | Python deque (maxlen=900); print "Buffer Full: 900 frames" every 30s then clear |
-| 2.4 | **Integrate pre-trained model** — drop in LSTM/ViT weights | DFDC champion LSTM *or* TimeSformer/ViT; run on `[900, 1024]` tensor; output `temporal_score` |
-| 2.5 | **Implement buffer resilience** — padding and interpolation | Zero-pad incomplete tensors; linear interpolation for frame gaps; `low_confidence_flag` |
-| 2.6 | **Aggregation integration** — receive and merge `TemporalAuditResult` | Batch path runs independently of Speed path; merge into periodic WebSocket event |
-| 2.7 | **React Dashboard Audit Panel** — 30s periodic temporal report UI | "Temporal Analysis of last 30s: 98% Natural Continuity. No micro-jitters detected." |
-| 2.8 | **Tests** — Temporal Service unit + integration suite | Buffer fill, tensor shape, padding, interpolation, LSTM inference, batch audit schema |
-
-### Temporal Model Strategy
-
-| Strategy | Description |
-|---|---|
-| **Pre-trained Models** | Grab open-source drop-in weights (e.g., DFDC LSTM from Kaggle champions, TimeSformer/ViT fine-tuned on Celeb-DF, LipForensics). |
-| **Training the LSTM Head** | Since the Vision Service extracts 1024-d features, the LSTM head is tiny (2-5 million parameters) and can be trained in hours on a single consumer GPU using FaceForensics++. |
+| 2.1 | **Aggregation aiokafka consumer loop** — `frames` topic pipeline driver | Replaces test-only `POST /aggregate`; Aggregation owns Speed Layer pipeline |
+| 2.2 | **Build Temporal Service** — aiokafka consumer + 20-frame deque buffer | `deque(maxlen=20)` per `stream_id`; tumbling window; subscribes to `frames` topic |
+| 2.3 | **docker-compose.yml** — wire `temporal-service` | Port 8004, `AGGREGATION_URL`, health check, `depends_on: kafka` |
+| 2.4 | **Integrate ResNext50+LSTM model** — reconstruct `modeling.py` | `DeepFakeDetector` class + `load_model`; fallback to random weights if `.pt` missing |
+| 2.5 | **Buffer resilience** — padding and sparse fallback | N<20: zero-pad; N<6: `UNKNOWN` without inference; `low_confidence_flag` |
+| 2.6 | **Aggregation temporal path** — receive `TemporalAuditResult`, wire health status | `POST /temporal_audit`; `temporal_service_status` field in health |
+| 2.7 | **React Dashboard** — wire `temporal_service_status` | Audit Panel already built in Phase 1; only missing: status field from health endpoint |
+| 2.8 | **Security fixes** — `weights_only=True`, JWT subprotocol, VITE_ env vars, Kafka SASL_PLAINTEXT | All 4 in Phase 2; full TLS (SASL_SSL) deferred to Phase 5 |
+| 2.9 | **RAG fix** — replace `SimpleHashEmbeddings` with `sentence-transformers` | `all-MiniLM-L6-v2`; fixes meaningless 0.75 threshold |
+| 2.10 | **Tests** — Temporal Service unit + integration suite | Buffer fill, tensor shape, padding, sparse fallback, inference, schema validation |
 
 ### SLA & Resilience
 
 | Failure | Impact | Response |
 |---|---|---|
 | Temporal Service crash | Speed Layer **unaffected** | Dashboard Audit Panel shows "Temporal Audit Unavailable — Relying on Spatial heuristics" |
-| Buffer incomplete (`N < 900`) | Reduced confidence | Zero-pad to `[900, 1024]`; set `low_confidence_flag: true` |
-| Buffer too sparse (`N < 300`, `< 10s`) | Insufficient data | Skip inference; return `temporal_verdict: "UNKNOWN"` |
-| Frame gaps in window | Sequence discontinuity | Linear interpolation from adjacent feature vectors |
+| Buffer incomplete (`N < 20`) | Reduced confidence | Zero-pad to 20 frames; set `low_confidence_flag: true` |
+| Buffer too sparse (`N < 6`) | Insufficient data | Skip inference; return `temporal_verdict: "UNKNOWN"` |
+| Frame gaps in window | Sequence discontinuity | Linear interpolation from adjacent tensors; log `frames_interpolated` |
 
 ### New Service
 
 - **Temporal Service** — `./temporal-service/`
 - **Port:** 8004
-- **Endpoints:** `GET /health`, `GET /batch_status`, `POST /flush`
+- **Endpoints:** `GET /health`, `GET /batch_status`
 
 ---
 

@@ -6,7 +6,7 @@
 > - `timestamp_ms` — Unix epoch milliseconds
 > - `latency_ms` — processing duration in milliseconds
 > - `deepfake_score` — float 0.0–1.0 from Vision Service (Speed Layer)
-> - `temporal_score` — float 0.0–1.0 from Temporal Service (Batch Layer, every 30s)
+> - `temporal_score` — float 0.0–1.0 from Temporal Service (Batch Layer, every ~0.67s / 20-frame tumbling window)
 > - `audit_verdict` — string `PASS | FAIL | UNKNOWN` from RAG / Aggregation
 > - `feature_vector` — 1024-d float array, penultimate EfficientNet-B4 layer output
 
@@ -81,25 +81,25 @@ Produced by the Aggregation Service by merging Vision Result and RAG Audit Verdi
 
 ## 4b. Temporal Audit Result *(Phase 2 — Batch Layer)*
 
-Produced by the Temporal Service every **30 seconds** (one per 900-frame buffer window). Sent via HTTP POST to the Aggregation Service and forwarded to MLflow and the WebSocket Dashboard Audit Panel.
+Produced by the Temporal Service every **~0.67s** (one per 20-frame tumbling window at 30 FPS). Sent via HTTP POST to `Aggregation Service POST /temporal_audit` and forwarded to the WebSocket Dashboard Audit Panel.
 
 ```json
 {
   "stream_id": "string",
-  "window_start_frame": "integer — frame_index of first vector in this window",
-  "window_end_frame": "integer — frame_index of last vector in this window",
-  "window_duration_s": "float — actual elapsed seconds covered (≤ 30s if incomplete)",
-  "temporal_score": "float (0.0–1.0) — LSTM/ViT deepfake probability over the sequence",
+  "window_start_frame": "integer — frame_index of first frame in this window",
+  "window_end_frame": "integer — frame_index of last frame in this window",
+  "window_duration_s": "float — actual elapsed seconds covered (≤ 0.67s if incomplete; 20 frames ÷ 30 FPS)",
+  "temporal_score": "float (0.0–1.0) — ResNext50+LSTM fake class probability",
   "temporal_verdict": "string (PASS | FAIL | UNKNOWN)",
-  "low_confidence_flag": "boolean — true when buffer was zero-padded (incomplete window)",
-  "frames_interpolated": "integer — number of feature vectors filled by interpolation",
-  "model_used": "string — e.g. 'dfdc-lstm-v1' or 'vit-celeb-df-v2'",
-  "latency_ms": "integer — inference time for this batch",
+  "low_confidence_flag": "boolean — true when buffer was zero-padded (N < 20 frames)",
+  "frames_interpolated": "integer — number of frame tensors filled by linear interpolation",
+  "model_used": "string — e.g. 'naman712-deep-fake-detection-v1' or 'random-fallback'",
+  "latency_ms": "integer — inference time for this window",
   "timestamp_ms": "integer"
 }
 ```
 
-> `temporal_verdict: "UNKNOWN"` is always returned when `low_confidence_flag: true` AND `window_duration_s < 10` (fewer than 10 seconds of real data — not enough for reliable sequence inference).
+> `temporal_verdict: "UNKNOWN"` is always returned when `N < 6` real frames in the buffer — not enough for reliable sequence inference. Zero-padding alone (N ≥ 6, N < 20) sets `low_confidence_flag: true` but still runs inference.
 
 ## 5. MLflow Telemetry Log
 

@@ -121,7 +121,7 @@ def test_score_combination(monkeypatch):
         mock_spatial.return_value = torch.tensor([[fixed_spatial]])
 
         body = {"stream_id": "s1", "frame_index": 0, "timestamp_ms": 1, "payload": payload_b64}
-        r = client.post("/infer", json=body, headers=HEADERS)
+        r = client.post("/infer", json=body, headers=headers)
 
     assert r.status_code == 200, r.text
     actual_score = r.json()["deepfake_score"]

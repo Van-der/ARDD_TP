@@ -1,7 +1,7 @@
 # ARDD-TP
 **Autonomous Real-Time Deepfake Detection & Telemetry Pipeline**
 
-Real-time video stream analysis pipeline built on a **Lambda Architecture** — combining a live frame-by-frame Speed Layer with a deep 30-second Batch Layer for temporal sequence analysis.
+Real-time video stream analysis pipeline built on a **Lambda Architecture** — combining a live frame-by-frame Speed Layer with a temporal Batch Layer that detects sequence-level anomalies every ~0.67 seconds.
 
 ---
 
@@ -16,7 +16,7 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 │       ▼                                                                     │
 │  ┌─────────────┐     ┌──────────┐                                           │
 │  │   Ingest    │────▶│  Kafka   │                                           │
-│  │   Gateway   │     │  Broker  │                                           │
+│  │   Gateway   │     │  frames  │                                           │
 │  └─────────────┘     └────┬─────┘                                           │
 │                           │                                                 │
 │             ┌─────────────┴─────────────┐                                   │
@@ -24,15 +24,15 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 │  ┌──────────────────────┐    ┌──────────────────────┐                       │
 │  │     SPEED LAYER      │    │     BATCH LAYER      │                       │
 │  │   (Vision Service)   │    │  (Temporal Service)  │                       │
-│  │ - Frame-by-frame     │    │ - 30-sec feature buf │                       │
+│  │ - Frame-by-frame     │    │ - 20-frame tumbling  │                       │
 │  │ - EfficientNet + FFT │    │ - Sequence analysis  │                       │
-│  │ - 200ms SLA          │    │ - LSTM / ViT Model   │                       │
+│  │ - 200ms SLA          │    │ - ResNext50 + LSTM   │                       │
 │  └──────────┬───────────┘    └──────────┬───────────┘                       │
 │             │                           │                                   │
 │             ▼                           ▼                                   │
 │  ┌──────────────────────────────────────────────────┐                       │
 │  │               Aggregation Service                │                       │
-│  │   Speed Result (live)   Batch Result (30s audit) │                       │
+│  │   Speed Result (live)   Batch Result (~0.67s)    │                       │
 │  └────────────────────────┬─────────────────────────┘                       │
 │                           │                                                 │
 │                           ▼                                                 │
@@ -42,7 +42,7 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 │                 │  │ Live Ticker │  │  ← frame-by-frame scores              │
 │                 │  └─────────────┘  │                                       │
 │                 │  ┌─────────────┐  │                                       │
-│                 │  │ Audit Panel │  │  ← 30-sec temporal report             │
+│                 │  │ Audit Panel │  │  ← temporal report (~0.67s)           │
 │                 │  └─────────────┘  │                                       │
 │                 └───────────────────┘                                       │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -57,10 +57,10 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 | Ingest Gateway | Python, OpenCV, FFmpeg |
 | Message Broker | Apache Kafka |
 | **Speed Layer** — Vision Service | PyTorch — EfficientNet-B4 + FFT, FastAPI |
-| **Batch Layer** — Temporal Service | PyTorch — Pre-trained LSTM / ViT (DFDC weights) |
-| Feature Buffer (Batch Layer) | In-memory Python deque / Redis |
-| Context Agent | LangChain (RAG, FAISS, Ollama/Mistral) |
-| Aggregation Service | Python, FastAPI, WebSockets (JWT) |
+| **Batch Layer** — Temporal Service | PyTorch — ResNext50+LSTM (`Naman712/Deep-fake-detection`), `aiokafka`, FastAPI |
+| Frame Buffer (Batch Layer) | In-memory `deque(maxlen=20)` per stream; Redis in Phase 3 |
+| Context Agent | LangChain (RAG, FAISS, `sentence-transformers`, Ollama/Mistral) |
+| Aggregation Service | Python, FastAPI, `aiokafka`, WebSockets (JWT) |
 | Experiment Tracking | MLflow |
 | Frontend | React + TypeScript + Zustand |
 | Infrastructure | Docker, Docker Compose |
@@ -69,39 +69,46 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 
 ## How It Works — The Lambda Pipeline
 
+Both layers independently consume from the same Kafka `frames` topic.
+
+**Speed Layer — per frame, 200ms SLA:**
+
 1. **Ingest Gateway** decodes a live RTSP/HTTP video feed, extracts frames at up to 30 FPS, and publishes `FramePayload` to the Kafka `frames` topic.
+2. **Aggregation Service** (aiokafka consumer) receives each frame and calls **Vision Service** via `POST /infer`.
+3. **Vision Service** runs MTCNN face alignment and the EfficientNet-B4 + FFT dual-branch model, returning `deepfake_score`.
+4. **Aggregation Service** calls the **RAG Context Agent** with the vision score (100ms budget). Merges both results into an `AggregatedResult` and pushes a live update to the React Dashboard — maintaining the **200ms end-to-end SLA**.
 
-2. **Speed Layer (Vision Service)** consumes each frame, runs MTCNN alignment, and executes the EfficientNet-B4 + FFT dual-branch model. It outputs both a `deepfake_score` **and** a `feature_vector` (1024-dimensional flattened tensor from the penultimate EfficientNet layer).
+**Batch Layer — every ~0.67s (20 frames at 30 FPS):**
 
-3. **Speed Aggregation** immediately checks the `deepfake_score` against the RAG Context Agent (100ms budget) and pushes a live result to the React Dashboard — maintaining the **200ms end-to-end SLA**.
-
-4. **Batch Layer (Temporal Service)** silently accumulates the `feature_vector` payloads from Kafka. Every **30 seconds** (900 vectors at 30 FPS), it runs a pre-trained sequence model (LSTM or ViT) over the full `[900, 1024]` tensor to detect temporal anomalies (micro-jitters, unnatural blinking, audio-visual de-sync).
-
-5. **Batch Aggregation** receives the temporal verdict every 30 seconds, merges it with historical stream context, logs a deep audit to MLflow, and pushes a periodic health report via WebSocket to the React Dashboard's Audit Panel.
+5. **Temporal Service** (separate aiokafka consumer, group `temporal-service-group`) independently receives the same `FramePayload` from the `frames` topic.
+6. Each JPEG is decoded to 112×112 RGB and ImageNet-normalised. Frames accumulate in a `deque(maxlen=20)` keyed by `stream_id`.
+7. At 20 frames, a `[1, 20, 3, 112, 112]` tensor is built and passed to **ResNext50+LSTM** (`Naman712/Deep-fake-detection`, 87% accuracy). Deque is cleared (tumbling window).
+8. `TemporalAuditResult` is POSTed to Aggregation Service and forwarded to the Dashboard's Audit Panel.
 
 ---
 
 ## Scoring Algorithm
 
 ```
-# Vision Service (Speed Layer)
-deepfake_score  = 0.6 · spatial_score + 0.4 · frequency_score
-feature_vector  = efficientnet_b4.penultimate_layer(face_crop)  # shape: [1024]
+# Vision Service — Speed Layer (per frame)
+deepfake_score = 0.6 · spatial_score + 0.4 · frequency_score
+# spatial_score  = EfficientNet-B4 sigmoid on aligned face crop
+# frequency_score = FFT branch sigmoid on frequency-domain frame
 
 # Aggregation Service — Speed Path
 final_score = clamp(deepfake_score · (1 + 0.15 · rag_boost), 0.0, 1.0)
 # rag_boost = 1 only when audit_verdict == "FAIL", else 0
 
-# Temporal Service — Batch Path (every 30s)
-temporal_sequence = stack(feature_vectors[-900:])  # shape: [900, 1024]
-temporal_score    = lstm_or_vit(temporal_sequence)  # float [0.0, 1.0]
+# Temporal Service — Batch Path (every ~0.67s)
+frames_tensor  = stack([decode_and_norm(f) for f in deque[-20:]])  # [1, 20, 3, 112, 112]
+temporal_score = F.softmax(logits, dim=1)[0][0].item()             # fake class probability
 ```
 
 **Alert fires** when `final_score > 0.90` for **5 or more consecutive frames** on the same stream.
 
 ---
 
-## SLA & Resilience Conditions
+## SLA & Resilience
 
 ### Speed Layer (200ms SLA — every frame)
 
@@ -113,21 +120,24 @@ temporal_score    = lstm_or_vit(temporal_sequence)  # float [0.0, 1.0]
 | MLflow unavailable | Telemetry buffered | Buffer up to 100 entries in memory; flush on recovery |
 | WebSocket disconnect | Dashboard freezes last state | Stale-data banner; exponential backoff reconnection |
 
-### Batch Layer (30-second audit cycle)
+### Batch Layer (~0.67s audit cycle — every 20 frames)
 
 | Failure | System State | Fallback |
 |---|---|---|
-| Temporal Service crashes or times out | Speed Layer **unaffected** — live scores continue | Dashboard Audit Panel shows **"Temporal Audit Unavailable — Relying on Spatial heuristics"** |
-| Stream drops before 30-second buffer is complete | Batch tensor shape is `[N, 1024]` where `N < 900` | Temporal Service **zero-pads** to `[900, 1024]` and appends `low_confidence_flag: true` to the Aggregation payload |
-| Frame drops / gaps in the 30-second window | Buffer contains non-contiguous sequence indices | Temporal Service **linearly interpolates** missing feature vectors from their adjacent neighbours before passing the sequence to the model |
+| Temporal Service crash or timeout | Speed Layer **unaffected** | Dashboard Audit Panel shows "Temporal Audit Unavailable — Relying on Spatial heuristics" |
+| Incomplete buffer (`N < 20`) | Reduced confidence | Zero-pad to 20 frames; set `low_confidence_flag: true`; continue inference |
+| Sparse buffer (`N < 6`) | Insufficient data | Skip inference; return `temporal_verdict: "UNKNOWN"` |
+| Frame gaps in window | Non-contiguous sequence | Linearly interpolate missing frame tensors; log `frames_interpolated` |
+| Model weights missing | Startup fallback | Use random-initialised model; set `model_used: "random-fallback"` |
 
 ---
 
 ## Security
 
 - Internal REST APIs require `X-API-Key` header on every request.
-- WebSocket access requires a JWT bearer token (HS256, 1-hour expiry) from `POST /auth/token`.
+- WebSocket access requires a JWT bearer token (HS256, 1-hour expiry) from `POST /auth/token`, passed via `Sec-WebSocket-Protocol` subprotocol.
 - All secrets injected via environment variables — see `.env.example`.
+- Kafka uses SASL_PLAINTEXT authentication (Phase 2). Full TLS (SASL_SSL) in Phase 5.
 
 ---
 
@@ -212,11 +222,11 @@ curl http://localhost:8001/health
 
 # RAG Agent (port 8002)
 curl http://localhost:8002/health
-# Expected: {"status":"ok","service":"rag-agent","uptime_s":0}
+# Expected: {"status":"ok","service":"rag-agent","uptime_s":<N>}
 
 # Aggregation Service (port 8003)
 curl http://localhost:8003/health
-# Expected: {"status":"ok","service":"aggregation-service","uptime_s":0}
+# Expected: {"status":"ok","service":"aggregation-service","uptime_s":<N>}
 
 # Temporal Service (port 8004)
 curl http://localhost:8004/health
@@ -236,7 +246,6 @@ python test_infrastructure.py
 ### Test the Infer Endpoint (Vision Service)
 
 ```bash
-# Encode a test JPEG and call /infer
 python - <<'EOF'
 import base64, requests, cv2, numpy as np
 
@@ -251,7 +260,7 @@ resp = requests.post(
 )
 print(resp.json())
 EOF
-# Expected: {"stream_id":"test","frame_index":0,"deepfake_score":0.5,"feature_vector":[...],"aligned":false,"latency_ms":<N>}
+# Expected: {"stream_id":"test","frame_index":0,"deepfake_score":0.5,"aligned":false,"latency_ms":<N>}
 ```
 
 ### Test the Full Pipeline (Aggregation Service)
@@ -264,21 +273,8 @@ TOKEN=$(curl -s -X POST http://localhost:8003/auth/token \
 
 echo "Token: $TOKEN"
 
-# Call /aggregate (triggers Vision + RAG speed path)
-python - <<'EOF'
-import base64, requests, cv2, numpy as np
-
-img = np.zeros((224, 224, 3), dtype=np.uint8)
-_, buf = cv2.imencode('.jpg', img)
-b64 = base64.b64encode(buf).decode()
-
-resp = requests.post(
-    "http://localhost:8003/aggregate",
-    json={"stream_id": "test", "frame_index": 0, "timestamp_ms": 0, "payload": b64},
-    headers={"X-API-Key": "your-internal-api-key-here"}
-)
-print(resp.json())
-EOF
+# Publish a test frame via the Ingest Gateway (triggers full Speed Layer pipeline)
+python simulate_stream.py
 ```
 
 ---
@@ -336,18 +332,18 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 | Vision Service | 16 | Unit: spatial branch, frequency branch, score formula, alignment failure, payload limits. Integration: schema, missing fields, malformed payload, auth. |
 | RAG Agent | 10 | Unit: high/low score verdicts. Integration: full schema, all 422 paths, both 401 paths, no-match UNKNOWN. |
 | Aggregation Service | 15 | Unit: all 6 TESTING.md §2 cases. Integration: full schema, Vision error 502, WebSocket auth, RAG timeout fallback. |
-| Temporal Service | ⏳ Phase 2 | Buffer fill, tensor shape, padding logic, interpolation, LSTM inference, batch audit schema. |
+| Temporal Service | ⏳ Phase 2 | Buffer fill, tensor shape, padding logic, sparse fallback, ResNext50+LSTM inference, batch audit schema. |
 
 ---
 
 ## Service Port Reference
 
-| Service | Internal Port | Host Port | Endpoint |
+| Service | Internal Port | Host Port | Endpoints |
 |---|---|---|---|
 | Vision Service | 8001 | 8001 | `POST /infer`, `GET /health` |
 | RAG Agent | 8002 | 8002 | `POST /audit`, `GET /health` |
-| Aggregation Service | 8003 | 8003 | `POST /aggregate`, `POST /auth/token`, `GET /health`, `ws://.../stream` |
-| **Temporal Service** | **8004** | **8004** | `GET /health`, `GET /batch_status`, `POST /flush` (Phase 2) |
+| Aggregation Service | 8003 | 8003 | `POST /auth/token`, `GET /health`, `ws://.../stream` |
+| Temporal Service | 8004 | 8004 | `GET /health`, `GET /batch_status` |
 | MLflow | 5000 | 5000 | Web UI + tracking API |
 | Kafka | 9092 | 9092 | Broker |
 | Ollama | 11434 | 11434 | LLM inference API |
@@ -371,12 +367,7 @@ docker compose up -d --force-recreate
 docker compose build vision-service && docker compose up -d vision-service
 
 # Aggregation service can't connect to Vision or RAG
-# Check env vars match: VISION_URL and RAG_URL (not VISION_SERVICE_URL)
 docker compose exec aggregation-service env | grep -E "VISION|RAG"
-
-# Temporal Service buffer stuck / not flushing
-# Force a manual flush (useful for debugging)
-curl -X POST http://localhost:8004/flush -H "X-API-Key: your-key"
 
 # Reset everything (destructive — removes all data)
 docker compose down -v
@@ -389,15 +380,17 @@ rm -rf mlflow-data ollama-data
 
 | File | Description |
 |---|---|
-| [`ARCHITECTURE.md`](./PLAN/ARCHITECTURE.md) | Component overview, service discovery, startup order |
-| [`FLOW.md`](./PLAN/FLOW.md) | System flow and sequence diagrams |
+| [`ARCHITECTURE.md`](./PLAN/ARCHITECTURE.md) | Component overview, Lambda Architecture detail, service discovery, startup order |
+| [`FLOW.md`](./PLAN/FLOW.md) | Mermaid sequence diagrams — Speed Layer and Batch Layer parallel flows |
 | [`PRD.md`](./PLAN/PRD.md) | Product requirements |
-| [`TRD.md`](./PLAN/TRD.md) | Technical requirements, scoring algorithm, SLA budgets |
+| [`TRD.md`](./PLAN/TRD.md) | Technical requirements, scoring algorithms, SLA budgets |
 | [`API_SPEC.md`](./PLAN/API_SPEC.md) | All service endpoints, auth contracts, Kafka topics |
 | [`SCHEMA.md`](./PLAN/SCHEMA.md) | Message, event, and threat signature schemas |
-| [`ERROR_HANDLING.md`](./PLAN/ERROR_HANDLING.md) | All failure scenarios and fallback behaviors |
+| [`ERROR_HANDLING.md`](./PLAN/ERROR_HANDLING.md) | All failure scenarios and fallback behaviours |
 | [`SECURITY.md`](./PLAN/SECURITY.md) | Security spec, threat model, secrets management |
 | [`TESTING.md`](./PLAN/TESTING.md) | Testing strategy, accuracy and performance benchmarks |
 | [`PHASES.md`](./PLAN/PHASES.md) | Step-by-step build order with verification commands |
 | [`ROADMAP.md`](./PLAN/ROADMAP.md) | Implementation phases and future state |
+| [`REFERENCES.md`](./PLAN/REFERENCES.md) | Models, datasets, and library citations |
 | [`Documentation.md`](./Documentation.md) | Development journal — session-by-session progress log |
+| [`TaskTo.md`](./TaskTo.md) | Phase audit findings and Phase 2 design decisions |

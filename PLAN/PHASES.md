@@ -54,13 +54,13 @@ print('OpenCV test OK')
 ```
 
 ### Step 3 — Vision Service
-- [ ] FastAPI app with `POST /infer` and `GET /health`
-- [ ] MTCNN face alignment
-- [ ] EfficientNet-B4 spatial branch
-- [ ] FFT frequency branch
-- [ ] Combine scores: `deepfake_score = 0.6·spatial + 0.4·frequency`
-- [ ] Alignment failure fallback: return `deepfake_score: 0.5`, `aligned: false`
-- [ ] `X-API-Key` auth middleware
+- [x] FastAPI app with `POST /infer` and `GET /health`
+- [x] MTCNN face alignment
+- [x] EfficientNet-B4 spatial branch
+- [x] FFT frequency branch
+- [x] Combine scores: `deepfake_score = 0.6·spatial + 0.4·frequency`
+- [x] Alignment failure fallback: return `deepfake_score: 0.5`, `aligned: false`
+- [x] `X-API-Key` auth middleware
 
 **Verification commands:**
 ```bash
@@ -198,116 +198,178 @@ locust -f locustfile.py --headless -u 1 -r 1 -t 5m --host=http://localhost:8003
 
 ## Phase 2 — Lambda Architecture: Temporal Batch Layer
 
-**Goal:** Introduce a parallel Batch Layer alongside the Speed Layer, forming a true Lambda Architecture for dual-SLA deepfake detection. No raw frames are buffered — only lightweight 1024-d feature vectors.
+**Goal:** Introduce a parallel Batch Layer alongside the Speed Layer, forming a true Lambda Architecture for dual-SLA deepfake detection. Temporal Service subscribes directly to the `frames` Kafka topic and runs its own ResNext50+LSTM sequence model on 20-frame tumbling windows (~0.67s at 30 FPS).
+
+> **Future scope:** Sliding window (overlapping inference every K frames) is a planned improvement once the tumbling window baseline is stable.
 
 **Prerequisites:** Phase 1 complete and all exit criteria passing.
 
-### Step 2.1 — Modify Vision Service: Expose Feature Vector
-- [ ] Extract the penultimate EfficientNet-B4 layer output (1024-d flattened tensor) during each `/infer` call
-- [ ] Add `feature_vector: List[float]` field to `VisionResult` schema
-- [ ] When `aligned: false`, set `feature_vector: null`
-- [ ] Publish `VisionResult` (including `feature_vector`) to Kafka `frames_processed` topic (base64-encoded `numpy.float32.tobytes()`)
+### Step 2.1 — Aggregation Service: Production Pipeline Driver
+- [ ] Add `aiokafka` to `aggregation-service/requirements.txt`; remove `kafka-python-ng` consumer usage (keep `KafkaAdminClient` in ingest gateway only)
+- [ ] Replace `threading.Thread` Kafka consumer in `aggregation-service/main.py` with `asyncio` task using `aiokafka.AIOKafkaConsumer`
+- [ ] Add production pipeline consumer loop: consume `FramePayload` from `frames` topic → `call_vision()` → `call_rag()` → broadcast → MLflow
+- [ ] Migrate existing `labels` Kafka consumer (`start_kafka_consumer`) to `aiokafka` in the same `startup_event`
+- [ ] Consumer group: `aggregation-pipeline-group` (separate from any other consumers)
 
 **Verification:**
 ```bash
-curl -X POST http://localhost:8001/infer \
-  -H "X-API-Key: $KEY" \
-  -d '{"stream_id":"test","frame_index":0,"timestamp_ms":0,"payload":"<b64>"}' \
-  | python3 -c "import sys,json; r=json.load(sys.stdin); print(len(r['feature_vector']), 'dimensions')"
-# Expected: 1024 dimensions
+# Start stack and publish a test frame to Kafka frames topic
+docker compose up -d
+python simulate_stream.py  # existing helper
+
+# Confirm AggregatedResult broadcast on WebSocket without calling POST /aggregate
+python -c "
+import websocket, json, requests
+token = requests.post('http://localhost:8003/auth/token', json={'client_id':'c','client_secret':'s'}).json()['access_token']
+ws = websocket.create_connection(f'ws://localhost:8003/stream?token={token}')
+print(json.loads(ws.recv()))
+"
 ```
 
-### Step 2.2 — Update Kafka Schema
-- [ ] Update `VisionResult` Kafka payload to include `feature_vector` as base64 string
-- [ ] Update `SCHEMA.md` (already done)
-- [ ] Update consumer deserialization in Temporal Service
-
-### Step 2.3 — Build Temporal Service: Buffer Node
-- [ ] New service `./temporal-service/` with `main.py`, `Dockerfile`, `requirements.txt`
-- [ ] Kafka consumer subscribed to `frames_processed` topic
-- [ ] Python `deque(maxlen=900)` buffer per `stream_id`; track `frame_index` for gap detection
-- [ ] Print/log `"Buffer Full: 900 frames"` every time buffer hits 900 vectors, then clear
+### Step 2.2 — Temporal Service: Build Buffer + Inference Node
+- [ ] New service `./temporal-service/` with `main.py`, `modeling.py`, `Dockerfile`, `requirements.txt`
+- [ ] Reconstruct `DeepFakeDetector` class in `modeling.py` (ResNext50 backbone + single LSTM layer + `linear1` head; `forward(x)` returns `(lstm_out, logits)`)
+- [ ] Load weights from `model_87_acc_20_frames_final_data.pt` at startup; fallback to random weights with `model_used: "random-fallback"` if file not found
+- [ ] `aiokafka` consumer subscribed to `frames` topic (consumer group: `temporal-service-group`)
+- [ ] Per `stream_id`: `deque(maxlen=20)` of preprocessed frame tensors (112×112, ImageNet normalisation)
+- [ ] On buffer full (20 frames): stack into `[1, 20, 3, 112, 112]` tensor → run inference → `temporal_score = F.softmax(logits, dim=1)[0][0].item()` (fake probability)
+- [ ] After inference: clear buffer (tumbling window), log `"Inference complete: stream={stream_id} score={temporal_score:.3f}"`
+- [ ] POST `TemporalAuditResult` to `http://aggregation-service:8003/temporal_audit`
 - [ ] `GET /health` endpoint returning `{status, buffer_sizes, uptime_s}`
 - [ ] `GET /batch_status` endpoint returning per-stream buffer fill levels
-- [ ] `POST /flush` endpoint to manually trigger early flush (for testing)
+- [ ] `POST /flush` endpoint to manually trigger early flush (for testing); runs full inference + POST to Aggregation
 - [ ] `X-API-Key` auth middleware on all endpoints
 - [ ] Port: **8004**
 
 **Verification:**
 ```bash
-# Build and test buffer node
+# Build and test
 docker build -t ardd-temporal ./temporal-service
 docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal pytest tests/ -v
 
 # Check buffer status
 curl http://localhost:8004/batch_status -H "X-API-Key: $KEY"
-# Expected: {"stream_id": "cam_01", "buffer_size": <N>, "target": 900}
-```
+# Expected: {"stream_id": "cam_01", "buffer_size": <N>, "target": 20}
 
-### Step 2.4 — Integrate Pre-trained Sequence Model
-- [ ] Download DFDC LSTM weights (Selim Seferbekov) OR TimeSformer/ViT weights (Celeb-DF)
-- [ ] Load model at startup; verify weights load without error
-- [ ] On buffer flush: stack feature vectors into `[900, 1024]` tensor; run inference; produce `TemporalAuditResult`
-- [ ] POST `TemporalAuditResult` to Aggregation Service `POST /temporal_audit`
-
-**Verification:**
-```bash
-# Test model loads
-docker exec temporal-service python -c "from main import temporal_model; print('Model OK')"
-
-# Trigger a manual flush with test data
+# Manual flush
 curl -X POST http://localhost:8004/flush -H "X-API-Key: $KEY" -d '{"stream_id":"test"}'
 # Expected: {"temporal_score": <float>, "temporal_verdict": "PASS|FAIL|UNKNOWN", ...}
 ```
 
-### Step 2.5 — Implement Buffer Resilience
-- [ ] Zero-pad incomplete tensor to `[900, 1024]` when `N < 900`; set `low_confidence_flag: true`
-- [ ] Return `temporal_verdict: "UNKNOWN"` immediately when `N < 300` (< 10 seconds of data)
-- [ ] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing vectors
+### Step 2.3 — Wire Temporal Service into docker-compose.yml
+- [ ] Add `temporal-service` service block: build `./temporal-service`, port `8004:8004`, `restart: unless-stopped`
+- [ ] Environment: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC_FRAMES=frames`, `INTERNAL_API_KEY`, `AGGREGATION_URL=http://aggregation-service:8003`, `MODEL_WEIGHTS_PATH=/app/weights/model_87_acc_20_frames_final_data.pt`
+- [ ] Mount weights file: `- /home/<user>/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/snapshots/.../model_87_acc_20_frames_final_data.pt:/app/weights/model_87_acc_20_frames_final_data.pt:ro`
+- [ ] Health check: `curl -f http://localhost:8004/health`
+- [ ] `depends_on: kafka`; add `temporal-service` to startup order before `frontend`
+
+**Verification:**
+```bash
+docker compose up -d temporal-service
+curl -f http://localhost:8004/health
+# Expected: {"status": "ok", "service": "temporal-service", ...}
+```
+
+### Step 2.4 — Implement Buffer Resilience
+- [ ] Pad incomplete buffer to 20 frames with zero tensors when `N < 20`; set `low_confidence_flag: true`
+- [ ] Return `temporal_verdict: "UNKNOWN"` immediately without inference when `N < 6` (< 20% of window — insufficient data)
+- [ ] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing tensors from adjacent neighbours
 - [ ] Include `frames_interpolated` count in `TemporalAuditResult`
 
 **Verification:**
 ```bash
-# Test padding (send only 500 vectors then flush)
+# Test padding (send only 12 frames then flush)
 curl -X POST http://localhost:8004/flush -H "X-API-Key: $KEY" -d '{"stream_id":"test"}'
 # Expected: low_confidence_flag: true in response
 
-# Test sparse buffer (send <300 vectors then flush)
+# Test sparse buffer (send <6 frames then flush)
 # Expected: temporal_verdict: "UNKNOWN" immediately
 ```
 
-### Step 2.6 — Aggregation Service: Temporal Path
-- [ ] Add `POST /temporal_audit` endpoint to Aggregation Service (accepts `TemporalAuditResult`)
-- [ ] Store latest `TemporalAuditResult` per `stream_id` in memory
-- [ ] Broadcast `TemporalAuditResult` to WebSocket clients as a distinct event type (`"type": "temporal_audit"`)
-- [ ] Log `TemporalAuditResult` to MLflow (separate experiment or run from per-frame logs)
-- [ ] Aggregation Service `GET /health` to show `temporal_service_status`
+### Step 2.5 — Aggregation Service: Temporal Path
+- [ ] `POST /temporal_audit` endpoint already implemented — verify it stores latest result per `stream_id`
+- [ ] Update `GET /health` to include `temporal_service_status: "ok" | "unavailable"` (HTTP ping to `http://temporal-service:8004/health`)
+- [ ] Confirm `TemporalAuditResult` broadcasts to WebSocket as `"type": "temporal_audit"` event
+- [ ] Confirm MLflow logging of temporal results
 
 **Verification:**
 ```bash
 curl -X POST http://localhost:8003/temporal_audit \
   -H "X-API-Key: $KEY" \
-  -d '{"stream_id":"test","window_start_frame":0,"window_end_frame":899,"temporal_score":0.3,"temporal_verdict":"PASS",...}'
+  -d '{"stream_id":"test","window_start_frame":0,"window_end_frame":19,"temporal_score":0.3,"temporal_verdict":"PASS","low_confidence_flag":false,"frames_interpolated":0,"model_used":"resnext50-lstm-v1","latency_ms":120,"window_duration_s":0.67,"timestamp_ms":0}'
 # Expected: 200 OK
+
+curl http://localhost:8003/health
+# Expected: includes temporal_service_status field
 ```
 
-### Step 2.7 — React Dashboard: Audit Panel
-- [ ] Add "Audit Panel" sidebar to React dashboard
-- [ ] Subscribe to WebSocket `temporal_audit` events
-- [ ] Display periodic text report: `"Temporal Analysis of last 30s: <score>% Natural Continuity. <verdict>."`
-- [ ] Show `"Temporal Audit Unavailable — Relying on Spatial heuristics"` when `temporal_service_status` is down
-- [ ] Show `low_confidence_flag` warning badge when set
+### Step 2.6 — React Dashboard: Wire temporal_service_status
+- [ ] AuditPanel already renders temporal audit data and "Temporal Audit Unavailable" fallback text (built in Phase 1 Step 7)
+- [ ] Fetch `GET /health` on connect; pass `temporal_service_status` into AuditPanel to drive the unavailable state
+- [ ] Update dashboard copy: `"Sequence Analysis: last 20 frames (~0.67s)"` replacing any "30s" references
 
-### Step 2.8 — Tests
+### Step 2.7 — RAG Agent: Replace Hash Embeddings
+- [ ] Add `sentence-transformers==2.7.0` to `rag-agent/requirements.txt`
+- [ ] Replace `SimpleHashEmbeddings` class with `HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")` from `langchain_community.embeddings`
+- [ ] Remove `hashlib` import; remove `SimpleHashEmbeddings` class entirely
+- [ ] Verify 0.75 similarity threshold still behaves correctly with real semantic vectors
+
+**Verification:**
+```bash
+cd rag-agent
+python -c "
+from langchain_community.embeddings import HuggingFaceEmbeddings
+emb = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+v = emb.embed_query('face swap artifacts boundary blending')
+print(f'Embedding dim: {len(v)}, range: [{min(v):.3f}, {max(v):.3f}]')
+"
+```
+
+### Step 2.8 — Security Fixes
+- [ ] `vision-service/main.py:44` — add `weights_only=True` to `torch.load` call
+- [ ] WebSocket JWT: switch from `?token=` query param to `Sec-WebSocket-Protocol` subprotocol in `frontend/src/App.tsx` and `aggregation-service/main.py`
+- [ ] Frontend: replace hardcoded `CLIENT_ID = 'test_client'` / `CLIENT_SECRET = 'test_secret'` with `import.meta.env.VITE_CLIENT_ID` / `VITE_CLIENT_SECRET`; add vars to `.env.example` and `docker-compose.yml` frontend env block
+- [ ] Kafka SASL_PLAINTEXT: add `KAFKA_SASL_MECHANISM: PLAIN`, `KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT`, `KAFKA_SASL_JAAS_CONFIG` to docker-compose broker; update all Kafka clients (Ingest Gateway, Aggregation Service, Temporal Service) with SASL credentials from `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` env vars
+
+> **Note:** Kafka TLS (SASL_SSL upgrade) is deferred to Phase 5 alongside full mTLS hardening.
+
+**Verification:**
+```bash
+# weights_only
+cd vision-service && python -c "import main; print('weights_only OK')"
+
+# WebSocket auth via subprotocol
+python -c "
+import websocket, requests
+token = requests.post('http://localhost:8003/auth/token', json={'client_id':'c','client_secret':'s'}).json()['access_token']
+ws = websocket.create_connection('ws://localhost:8003/stream', header={'Sec-WebSocket-Protocol': token})
+print('WS subprotocol auth OK')
+"
+
+# Kafka SASL
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list \
+  --command-config /tmp/client.properties
+```
+
+### Step 2.9 — Documentation Updates
+- [ ] Update `FLOW.md` sequence diagram to show Temporal Service consuming from `frames` topic and posting to Aggregation
+- [ ] Update `ROADMAP.md` Phase 1 status table: MLflow ✅ Done, React dashboard ✅ Done
+- [ ] Update `ARCHITECTURE.md`: Temporal Service description (ResNext50+LSTM, 20-frame tumbling window, subscribes to `frames` topic)
+- [ ] Add known limitation to `ERROR_HANDLING.md`: "Aggregation Service alert counter and drift history reset on restart; mitigated by Redis in Phase 3"
+
+### Step 2.10 — Tests
 - [ ] `temporal-service/tests/test_temporal.py`:
-  - Buffer fill and flush trigger
-  - Correct tensor shape `[900, 1024]`
-  - Zero-padding logic (`low_confidence_flag` set correctly)
-  - Sparse buffer → `UNKNOWN` without inference
-  - Linear interpolation (insert gap, verify `frames_interpolated > 0`)
-  - LSTM/ViT inference produces valid `temporal_score` in `[0.0, 1.0]`
-  - `TemporalAuditResult` schema validation
-  - Auth 401 on missing `X-API-Key`
+  - Buffer fill (20 frames) triggers flush and clears buffer (tumbling window)
+  - Correct input tensor shape `[1, 20, 3, 112, 112]`
+  - Zero-padding logic: `N < 20` → `low_confidence_flag: true`
+  - Sparse buffer: `N < 6` → `temporal_verdict: "UNKNOWN"` without inference
+  - Linear interpolation: insert gap, verify `frames_interpolated > 0`
+  - ResNext50+LSTM inference produces valid `temporal_score` in `[0.0, 1.0]`
+  - `TemporalAuditResult` schema validation (all fields present and typed)
+  - Auth 401 on missing `X-API-Key` for `/health`, `/batch_status`, `/flush`
+  - `GET /health` returns `{status, buffer_sizes, uptime_s}`
+  - `GET /batch_status` returns per-stream fill levels
+  - `POST /flush` triggers inference AND posts result to Aggregation Service
 
 **Verification:**
 ```bash
@@ -317,10 +379,11 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 ```
 
 **Phase 2 exit criteria:**
-- Both Speed Layer (200ms SLA) and Batch Layer (30s cycle) operating simultaneously without interference
+- Speed Layer (200ms SLA) and Batch Layer (20-frame tumbling, ~0.67s cycle) operating simultaneously without interference
 - Temporal Service crash does not affect Speed Layer or live dashboard scores
-- All buffer resilience conditions (padding, interpolation, sparse) correctly handled and tested
+- All buffer resilience conditions (padding, sparse, interpolation) correctly handled and tested
 - React Dashboard shows both Live Ticker and Audit Panel updating independently
+- Kafka SASL_PLAINTEXT enforced on all broker connections
 - All Temporal Service tests pass
 
 ---
@@ -356,7 +419,7 @@ docker compose up -d --scale vision-service=2
 kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group vision-consumers
 ```
 
-**Phase 2 exit criteria:**
+**Phase 3 exit criteria:**
 - 3 concurrent streams at 30 FPS each, p95 latency ≤ 200ms
 - Vision Service scales horizontally without dropping frames
 - Kafka consumer group rebalance (add/remove replica) completes without frame loss
@@ -407,7 +470,7 @@ curl -X POST http://localhost:8001/admin/swap_weights -H "X-API-Key: ${INTERNAL_
 tail -f logs/aggregation.log | grep -i drift
 ```
 
-**Phase 3 exit criteria:**
+**Phase 4 exit criteria:**
 - Drift-triggered retraining completes and new weights are deployed without service restart
 - Atomic swap verified: zero inference errors during cutover under load
 - Rollback verified: bad weights trigger automatic revert within 500 frames
@@ -470,7 +533,7 @@ openssl s_client -connect vision-service:8001 -CAfile ca.crt -cert client.crt -k
 ps aux | grep -i reload
 ```
 
-**Phase 4 exit criteria:**
+**Phase 5 exit criteria:**
 - Flagged stream segments retrievable from object storage
 - OpenTelemetry trace shows per-hop latency for every frame
 - All internal links verified mTLS with `openssl s_client`
