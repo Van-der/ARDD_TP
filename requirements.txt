@@ -1,0 +1,34 @@
+# Core framework
+fastapi
+uvicorn[standard]
+pydantic
+
+# Kafka
+kafka-python
+aiokafka
+
+# Computer vision & deep learning
+opencv-python
+torch
+torchvision
+facenet-pytorch
+Pillow
+numpy
+
+# HTTP clients
+httpx
+requests
+
+# Auth
+PyJWT
+
+# ML tracking
+mlflow
+
+# Load testing
+locust
+
+# Testing
+pytest
+pytest-asyncio
+websocket-client
