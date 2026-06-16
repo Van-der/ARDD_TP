@@ -1,9 +1,9 @@
 
 import { useStore } from '../store';
-import { Clock, Search, ShieldAlert, CheckCircle2, HelpCircle } from 'lucide-react';
+import { Clock, Search, ShieldAlert, CheckCircle2, HelpCircle, BarChart2 } from 'lucide-react';
 
 export const AuditPanel = () => {
-  const { frames, latestTemporalAudit, connected } = useStore();
+  const { frames, latestTemporalAudit, connected, verdictCounts, resetVerdictCounts } = useStore();
   const latestFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
   const renderVerdictBadge = (verdict: string) => {
@@ -71,6 +71,45 @@ export const AuditPanel = () => {
           <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
             Temporal Audit Unavailable — Relying on Spatial heuristics.
           </span>
+        )}
+      </div>
+      {/* Verdict Tally */}
+      <div className="card flex-col gap-3">
+        <div className="flex-row justify-between" style={{ alignItems: 'center' }}>
+          <div className="flex-row gap-2" style={{ color: 'var(--text-secondary)' }}>
+            <BarChart2 size={18} />
+            <h3 style={{ fontSize: '1rem' }}>Temporal Verdict Tally</h3>
+          </div>
+          <button
+            onClick={resetVerdictCounts}
+            style={{ fontSize: '0.75rem', color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 6px', borderRadius: '4px' }}
+          >
+            Reset
+          </button>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem' }}>
+          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(34,197,94,0.08)', borderRadius: '8px', border: '1px solid rgba(34,197,94,0.2)' }}>
+            <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--success)' }}>{verdictCounts.PASS}</div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>REAL</div>
+          </div>
+          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(239,68,68,0.08)', borderRadius: '8px', border: '1px solid rgba(239,68,68,0.2)' }}>
+            <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--danger)' }}>{verdictCounts.FAIL}</div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>FAKE</div>
+          </div>
+          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(107,114,128,0.08)', borderRadius: '8px', border: '1px solid rgba(107,114,128,0.2)' }}>
+            <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-muted)' }}>{verdictCounts.UNKNOWN}</div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>UNKNOWN</div>
+          </div>
+        </div>
+
+        {(verdictCounts.PASS + verdictCounts.FAIL) > 0 && (
+          <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', textAlign: 'center' }}>
+            {verdictCounts.PASS + verdictCounts.FAIL} audits —{' '}
+            <span style={{ color: 'var(--danger)' }}>
+              {((verdictCounts.FAIL / (verdictCounts.PASS + verdictCounts.FAIL)) * 100).toFixed(1)}% flagged fake
+            </span>
+          </div>
         )}
       </div>
     </div>

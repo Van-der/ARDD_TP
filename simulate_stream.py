@@ -21,6 +21,10 @@ def main():
     print("Connecting to Kafka...")
     producer = KafkaProducer(
         bootstrap_servers='localhost:9092',
+        security_protocol='SASL_PLAINTEXT',
+        sasl_mechanism='PLAIN',
+        sasl_plain_username='admin',
+        sasl_plain_password='admin-secret',
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
     )
     

@@ -52,7 +52,7 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 |---|---|
 | Ingest Gateway | Python, OpenCV, FFmpeg, `kafka-python-ng` |
 | Message Broker | Apache Kafka (SASL_PLAINTEXT) |
-| **Speed Layer** — Vision Service | PyTorch — EfficientNet-B4 + FFT, MTCNN, FastAPI |
+| **Speed Layer** — Vision Service | PyTorch — EfficientNet-B4 (fine-tuned) + FFT MLP (trained), MTCNN, FastAPI |
 | **Batch Layer** — Temporal Service | PyTorch — ResNext50+LSTM (`Naman712/Deep-fake-detection`), `aiokafka`, FastAPI |
 | Frame Buffer (Batch Layer) | In-memory `deque(maxlen=20)` per stream; Redis in Phase 3 |
 | Context Agent | LangChain (RAG, FAISS, `sentence-transformers`, Ollama/Mistral) |
@@ -202,6 +202,9 @@ ARDD_TP/
 ├── locustfile.py              # Load test definition (Locust)
 ├── prepare_test_dataset.py    # Generates labelled frame samples for tests
 ├── simulate_stream.py         # Publishes synthetic frames to Kafka for local dev
+├── video_feeder.py            # Streams real FF++ videos to Kafka (demo + eval modes)
+├── extract_faces.py           # Offline MTCNN face crop extraction from FF++ videos (Phase 2.5)
+├── train_vision.py            # EfficientNet-B4 + FFT MLP training script (Phase 2.5)
 ├── test_infrastructure.py     # Smoke-tests that required files and dirs exist
 ├── README.md
 ├── Documentation.md           # Session-by-session development journal
@@ -228,9 +231,10 @@ ARDD_TP/
 │   └── tests/
 │       └── test_ingest.py
 │
-├── vision-service/            # Speed Layer — EfficientNet-B4 + FFT per-frame inference
+├── vision-service/            # Speed Layer — EfficientNet-B4 + FFT MLP per-frame inference
 │   ├── Dockerfile             # python:3.11-slim (Python 3.14 incompatible with facenet-pytorch)
 │   ├── main.py
+│   ├── modeling.py            # FftMlp class: 64-dim radial FFT bins → fake probability (Phase 2.5)
 │   ├── requirements.txt
 │   └── tests/
 │       └── test_vision.py
@@ -273,7 +277,7 @@ ARDD_TP/
 │       ├── App.css
 │       ├── index.css
 │       ├── main.tsx
-│       ├── store.ts           # Zustand state: frames, alerts, JWT, connection status
+│       ├── store.ts           # Zustand state: frames, alerts, JWT, connection status, verdictCounts
 │       ├── store.test.ts
 │       └── components/
 │           ├── AlertBanner.tsx    # Consecutive-alert warning banner

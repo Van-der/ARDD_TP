@@ -225,3 +225,89 @@ Ran full audit of Phases 1 and 2 code. All critical issues fixed during session.
 ### Status
 
 Phase 2 ✅ substantially complete. 53/53 unit tests passing across 4 services. Two items deferred: linear interpolation (`frames_interpolated` always 0) and frontend health-status wiring. Six deprecation items documented in `TaskTo.md` for next session. Ready to begin Phase 3 once deprecation items addressed.
+
+---
+
+## Session: 2026-06-16/17 — Pipeline Fixes, UI Updates & Speed Layer Training Design
+
+### Work Completed
+
+#### Pipeline Bug Fixes (post-Phase 2 audit)
+
+- **Frontend unhealthy** — `curl` not present in `node:20-alpine` image; added `RUN apk add --no-cache curl` to `frontend/Dockerfile`.
+- **Kafka unreachable from host** — `kafka:9092` not resolvable outside Docker; added `127.0.0.1 kafka` to `/etc/hosts`. Allows `simulate_stream.py` and `video_feeder.py` to reach the broker from the host.
+- **CORS 405 on `/auth/token`** — FastAPI had no OPTIONS handler; added `CORSMiddleware` to `aggregation-service/main.py` (`allow_origins=["*"]`).
+- **Temporal weights not found** — HuggingFace snapshot directory uses symlinks that don't resolve inside Docker bind mounts; changed `docker-compose.yml` volume to point directly at the blob file (`~/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/blobs/<sha>`).
+- **Temporal key mismatch** — Naman712 checkpoint stores weights under `model.*` keys; our `DeepFakeDetector` class uses `backbone.*`; added key remapping on load in `temporal-service/main.py`.
+- **Temporal always authentic** — `nn.LSTM` defaults to `bias=True`; Naman712 was trained with `bias=False`; fixed in `temporal-service/modeling.py`.
+
+Full pipeline now working end-to-end: `simulate_stream.py` / `video_feeder.py` → Kafka → Aggregation → Vision + RAG → WebSocket → Dashboard.
+
+#### Frontend: Verdict Tally UI
+
+- Added `VerdictCounts` interface (`PASS`, `FAIL`, `UNKNOWN` counters) and state to `frontend/src/store.ts`.
+- `setTemporalAudit` now increments the corresponding `verdictCounts` bucket on every temporal audit event.
+- Added `resetVerdictCounts` action.
+- Added **"Temporal Verdict Tally"** card to `frontend/src/components/AuditPanel.tsx`: three coloured counters (REAL / FAKE / UNKNOWN), a Reset button, and a `"X audits — Y% flagged fake"` summary line shown once at least one verdict is recorded.
+
+#### FaceForensics++ Dataset
+
+- Obtained official access approval; downloaded the `download-FaceForensics.py` script from the EU2 server.
+- Downloaded initial 50 real + 50 fake videos at c23 compression for quick smoke-testing.
+- Full dataset download (1000 real + 2000 fake) running in background (`/tmp/ff_original.log`, `/tmp/ff_deepfakes.log`).
+- Added `download-FaceForensics.py` and `datasets/` to `.gitignore` (download script contains private URL; dataset is too large to commit).
+
+#### `video_feeder.py` — FF++ Video Feeder
+
+- Created `video_feeder.py` at the repo root.
+- Reads FF++ videos from `datasets/ff++/` and publishes frames to Kafka with SASL_PLAINTEXT.
+- **`demo` mode** (default): alternates one real and one fake video every `--switch-every` seconds so the Temporal Audit panel visibly flips between Authentic / Fake on the live dashboard.
+- **`eval` mode**: streams all real videos then all fake videos sequentially, printing ground-truth labels alongside Temporal Service scores — used for FF++ benchmark collection.
+
+#### Speed Layer Training Design (Grill-Me Session, 2026-06-17)
+
+Ran a full 15-question design review to lock every decision before writing any training code.
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Face extraction | Pre-extract offline (MTCNN, saved crops) | Avoids paying MTCNN cost ~180K times during training; inference pipeline unchanged (MTCNN runs live) |
+| FFT features | Radial bins, 64-dim | Fixed-length, rotationally invariant; works well for compression artefacts |
+| Fusion method | Logistic regression (learned α) | Interpretable, 2 parameters, no risk of fusion overfitting |
+| Augmentation | Safe set (HFlip / brightness / crop) | Preserves frequency-domain structure; no GAN-style augmentation |
+| Dataset split | Official FF++ 720/140/140 | Comparable to published benchmarks |
+| Frame sampling | Every 5th frame | ~3 600 frames/video → ~180K crops from 1000 real + 2000 fake |
+| Class imbalance | `CrossEntropyLoss(weight=[2.0, 1.0])` | Uses all data; no undersampling |
+| Batch size | 16 | RTX 4050 6GB VRAM ceiling with full EfficientNet-B4 |
+| EfficientNet LR | 1e-4 with cosine annealing | Standard fine-tuning LR for ImageNet-pretrained backbone |
+| FFT MLP LR | 1e-3 | Small network; learns faster |
+| Epochs | 10 | Enough for convergence; early stopping not used (large dataset is the regulariser) |
+| LR schedule | Cosine annealing | Smooth decay; better than step for fine-tuning |
+| Model save | `state_dict` only | Consistent with how Naman712 weights are loaded; portable across refactors |
+| Early stopping | Disabled — run all 10 epochs | Full dataset + augmentation + dropout(0.3) on MLP handle overfitting |
+| MLP dropout | p=0.3 on hidden layer | Lightweight regularisation in place of early stopping |
+
+#### Pre-Training File Checklist
+
+These files must be created/modified before training begins:
+
+**Create (new):**
+1. `extract_faces.py` — offline MTCNN face crop extraction from FF++ videos
+2. `train_vision.py` — EfficientNet-B4 + FFT MLP training script (weighted loss, cosine LR, state_dict save)
+3. `vision-service/modeling.py` — `FftMlp` class definition (64 → 32 → 1 + dropout)
+
+**Modify (existing):**
+4. `vision-service/main.py` — replace hardcoded FFT heuristic with trained `FftMlp` + load checkpoint
+5. `docker-compose.yml` — add GPU passthrough block to `vision-service`:
+   ```yaml
+   deploy:
+     resources:
+       reservations:
+         devices:
+           - driver: nvidia
+             count: 1
+             capabilities: [gpu]
+   ```
+
+### Status
+
+Pipeline MVP fully working end-to-end with real FF++ videos. Speed layer training design locked (15 decisions). Pre-training file checklist documented. Next: write `extract_faces.py` → `train_vision.py` → update `vision-service/` → run training on RTX 4050.

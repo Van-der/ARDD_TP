@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import mlflow
@@ -33,14 +34,13 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 RAG_TIMEOUT = 0.100  # 100ms
 
 def _kafka_sasl_kwargs() -> dict:
-    if KAFKA_SECURITY_PROTOCOL == "SASL_PLAINTEXT":
-        return {
-            "security_protocol": "SASL_PLAINTEXT",
-            "sasl_mechanism": "PLAIN",
-            "sasl_plain_username": KAFKA_SASL_USERNAME,
-            "sasl_plain_password": KAFKA_SASL_PASSWORD,
-        }
-    return {}
+    return {
+        "security_protocol": "SASL_PLAINTEXT",
+        "sasl_mechanism": "PLAIN",
+        "sasl_plain_username": "admin",
+        "sasl_plain_password": "admin-secret",
+        "api_version": "auto",
+    }
 
 # Setup MLflow
 try:
@@ -123,6 +123,13 @@ class TemporalAuditResult(BaseModel):
     timestamp_ms: int
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def process_labeled_result(result: dict, label: str):
     if label == "REAL":

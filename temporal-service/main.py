@@ -33,14 +33,13 @@ KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
 AGGREGATION_URL = os.getenv("AGGREGATION_URL", "http://aggregation-service:8003")
 
 def _kafka_sasl_kwargs() -> dict:
-    if KAFKA_SECURITY_PROTOCOL == "SASL_PLAINTEXT":
-        return {
-            "security_protocol": "SASL_PLAINTEXT",
-            "sasl_mechanism": "PLAIN",
-            "sasl_plain_username": KAFKA_SASL_USERNAME,
-            "sasl_plain_password": KAFKA_SASL_PASSWORD,
-        }
-    return {}
+    return {
+        "security_protocol": "SASL_PLAINTEXT",
+        "sasl_mechanism": "PLAIN",
+        "sasl_plain_username": "admin",
+        "sasl_plain_password": "admin-secret",
+        "api_version": "auto",
+    }
 WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "/app/weights/model_87_acc_20_frames_final_data.pt")
 START_TIME = time.time()
 TARGET_FRAMES = 20
@@ -53,7 +52,15 @@ model_used = "random-fallback"
 model = DeepFakeDetector()
 try:
     if os.path.exists(WEIGHTS_PATH):
-        model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device, weights_only=True))
+        raw_sd = torch.load(WEIGHTS_PATH, map_location=device, weights_only=True)
+        # Checkpoint uses "model.*" keys; our class uses "backbone.*" — remap on load
+        remapped = {
+            k.replace("model.", "backbone.", 1) if k.startswith("model.") else k: v
+            for k, v in raw_sd.items()
+        }
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        if missing:
+            logger.warning(f"Weights loaded with {len(missing)} unexpected missing keys: {missing}")
         model_used = "resnext50-lstm-v1"
         logger.info(f"Loaded weights from {WEIGHTS_PATH}")
     else:

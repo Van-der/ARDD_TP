@@ -33,6 +33,7 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_OPTS: "-Ddummy=true"
     ports:
       - "9092:9092"
     networks:
@@ -162,7 +163,7 @@ services:
       - KAFKA_SASL_USERNAME=${KAFKA_SASL_USERNAME:-admin}
       - KAFKA_SASL_PASSWORD=${KAFKA_SASL_PASSWORD:-admin-secret}
     volumes:
-      - ${HOME}/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/snapshots/103847a47c2a1a335eeebed2f411d02ac83967b6:/app/weights:ro
+      - ${HOME}/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/blobs/0f1b48a51886f487e7ce9880a59ddf6c44e7da0d5b5265ed772871e1e9b1c578:/app/weights/model_87_acc_20_frames_final_data.pt:ro
     networks:
       - ardd_net
     restart: unless-stopped
@@ -216,8 +217,8 @@ services:
         condition: service_healthy
     environment:
       # Vite reads VITE_* env vars at build time via import.meta.env
-      - VITE_API_URL=http://aggregation-service:8003
-      - VITE_WS_URL=ws://aggregation-service:8003/stream
+      - VITE_API_URL=http://localhost:8003
+      - VITE_WS_URL=ws://localhost:8003/stream
       - VITE_CLIENT_ID=${CLIENT_ID:-test_client}
       - VITE_CLIENT_SECRET=${CLIENT_SECRET:-test_secret}
     ports:

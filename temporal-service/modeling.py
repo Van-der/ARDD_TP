@@ -18,7 +18,8 @@ class DeepFakeDetector(nn.Module):
             input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=lstm_layers,
-            batch_first=True
+            batch_first=True,
+            bias=False  # Naman712 checkpoint was trained without LSTM biases
         )
         
         self.linear1 = nn.Linear(hidden_size, num_classes)

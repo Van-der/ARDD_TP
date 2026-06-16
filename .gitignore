@@ -55,3 +55,13 @@ TaskTo.md
 
 # Ollama local models
 ollama-data/
+
+# FaceForensics++ download script (contains private download URL)
+download-FaceForensics.py
+
+# FaceForensics++ dataset (large files)
+datasets/
+
+# Training artifacts
+checkpoints/
+face_crops/

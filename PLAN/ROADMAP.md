@@ -84,6 +84,24 @@ The system evolves from a simple sequential pipeline to a **split-stream Lambda 
 
 ---
 
+## Phase 2.5 — Speed Layer Training ⬜ In Progress
+
+Replaces the ImageNet-pretrained EfficientNet-B4 + heuristic FFT branch with a fully trained dual-branch model on FaceForensics++ data.
+
+| Component | Status | Notes |
+|---|---|---|
+| Dataset | ⬜ Downloading | FF++ c23, 1000 real + 2000 fake; 50+50 test sample ready |
+| `vision-service/modeling.py` — `FftMlp` class | ⬜ Pending | 64→32→1 + Dropout(0.3) |
+| `extract_faces.py` | ⬜ Pending | MTCNN offline crop extraction, every 5th frame |
+| `train_vision.py` | ⬜ Pending | EfficientNet-B4 fine-tune + FFT MLP training |
+| `vision-service/main.py` — replace heuristic | ⬜ Pending | Load trained `FftMlp` + learned `alpha` fusion |
+| `docker-compose.yml` — GPU passthrough | ⬜ Pending | `nvidia-container-toolkit` already installed |
+| FF++ benchmark results | ⬜ Pending | `video_feeder.py --mode eval` on 140+140 test set |
+
+**Design decisions locked 2026-06-17:** radial FFT bins (64-dim), logistic regression fusion (learned α), safe augmentation, official 720/140/140 split, every-5th-frame sampling, weighted loss `[2.0, 1.0]`, batch=16, EfficientNet LR=1e-4 + MLP LR=1e-3, cosine annealing, 10 epochs, state_dict save, no early stopping, MLP dropout(0.3).
+
+---
+
 ## Phase 3 — Performance & Scalability
 
 Improvements to throughput and inter-service communication efficiency.

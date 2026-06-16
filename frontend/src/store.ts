@@ -15,11 +15,17 @@ export interface TemporalAudit {
   low_confidence_flag: boolean;
 }
 
+export interface VerdictCounts {
+  PASS: number;
+  FAIL: number;
+  UNKNOWN: number;
+}
+
 interface AppState {
   // Auth
   token: string | null;
   setToken: (token: string) => void;
-  
+
   // Connection
   connected: boolean;
   setConnected: (status: boolean) => void;
@@ -34,7 +40,11 @@ interface AppState {
   // Audits
   latestTemporalAudit: TemporalAudit | null;
   setTemporalAudit: (audit: TemporalAudit) => void;
-  
+
+  // Verdict counters
+  verdictCounts: VerdictCounts;
+  resetVerdictCounts: () => void;
+
   // Alerts
   activeAlert: boolean;
   setActiveAlert: (status: boolean) => void;
@@ -62,7 +72,16 @@ export const useStore = create<AppState>((set) => ({
   clearFrames: () => set({ frames: [] }),
 
   latestTemporalAudit: null,
-  setTemporalAudit: (audit) => set({ latestTemporalAudit: audit }),
+  setTemporalAudit: (audit) => set((state) => ({
+    latestTemporalAudit: audit,
+    verdictCounts: {
+      ...state.verdictCounts,
+      [audit.temporal_verdict]: (state.verdictCounts[audit.temporal_verdict as keyof VerdictCounts] ?? 0) + 1,
+    },
+  })),
+
+  verdictCounts: { PASS: 0, FAIL: 0, UNKNOWN: 0 },
+  resetVerdictCounts: () => set({ verdictCounts: { PASS: 0, FAIL: 0, UNKNOWN: 0 } }),
 
   activeAlert: false,
   setActiveAlert: (activeAlert) => set({ activeAlert })

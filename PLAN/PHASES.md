@@ -392,6 +392,84 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 
 ---
 
+## Phase 2.5 — Speed Layer Training (EfficientNet-B4 + FFT MLP)
+
+**Goal:** Replace the heuristic FFT frequency branch with a trained MLP, and fine-tune the full EfficientNet-B4 spatial branch on FaceForensics++ (FF++) data. After this phase the Vision Service runs a fully trained dual-branch model instead of the ImageNet-pretrained + heuristic combination.
+
+> **Status:** Design locked 2026-06-17 (15-decision grill-me session). Pre-training files not yet written.
+
+**Prerequisites:** Phase 2 complete. FaceForensics++ dataset downloaded (1000 real + 2000 fake, c23 compression). `nvidia-container-toolkit` installed and configured.
+
+### Step 2.5.1 — Create `vision-service/modeling.py`
+- [ ] Define `FftMlp` class: `Linear(64→32) → ReLU → Dropout(0.3) → Linear(32→1) → Sigmoid`
+- [ ] Input: 64-dim radial FFT bin vector
+- [ ] Output: scalar fake probability
+
+### Step 2.5.2 — Create `extract_faces.py`
+- [ ] Scan `datasets/ff++/original_sequences/youtube/c23/videos/` (real) and `manipulated_sequences/Deepfakes/c23/videos/` (fake)
+- [ ] Sample every 5th frame per video
+- [ ] Run MTCNN; skip frames with no detected face
+- [ ] Resize crop to 380×380; save JPEG to `face_crops/real/<stem>/` and `face_crops/fake/<stem>/`
+- [ ] Expected: ~180K crops total from 3000 videos
+
+**Verification:**
+```bash
+python extract_faces.py
+ls face_crops/real/ | wc -l   # expect ~1000 video dirs
+ls face_crops/fake/ | wc -l   # expect ~2000 video dirs
+```
+
+### Step 2.5.3 — Create `train_vision.py`
+- [ ] Load EfficientNet-B4 (ImageNet weights); unfreeze all layers
+- [ ] Load `FftMlp` from `vision-service/modeling.py`
+- [ ] Official FF++ split: 720 train / 140 val / 140 test video directories
+- [ ] `CrossEntropyLoss(weight=torch.tensor([2.0, 1.0]))` for 2:1 fake:real imbalance
+- [ ] Safe augmentation: `RandomHorizontalFlip`, `ColorJitter(brightness=0.2)`, `RandomCrop(380)`
+- [ ] Batch=16, EfficientNet LR=1e-4, MLP LR=1e-3, cosine annealing, 10 epochs
+- [ ] Save `checkpoints/efficientnet_b4_ff++.pt` and `checkpoints/fft_mlp_ff++.pt` (state_dict only)
+- [ ] Fit logistic regression scalar `alpha` on val set; save alongside checkpoints
+
+**Verification:**
+```bash
+python train_vision.py
+# Expected output: epoch logs + final val accuracy
+ls checkpoints/
+# efficientnet_b4_ff++.pt  fft_mlp_ff++.pt  alpha.pkl
+```
+
+### Step 2.5.4 — Update `vision-service/main.py`
+- [ ] Import `FftMlp` from `modeling.py`
+- [ ] Load MLP weights from `/app/weights/fft_mlp_ff++.pt` at startup; fallback to heuristic if missing
+- [ ] Replace hardcoded `fft_heuristic_score()` call with `FftMlp` forward pass
+- [ ] Replace hardcoded `0.6 / 0.4` fusion with learned `alpha` scalar
+
+### Step 2.5.5 — Update `docker-compose.yml`
+- [ ] Add GPU passthrough to `vision-service`:
+  ```yaml
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  ```
+- [ ] Add volume mounts for `checkpoints/efficientnet_b4_ff++.pt` and `checkpoints/fft_mlp_ff++.pt`
+
+### Step 2.5.6 — Benchmark with `video_feeder.py`
+- [ ] Run `python video_feeder.py --mode eval` against FF++ test set (140 real + 140 fake videos)
+- [ ] Collect temporal and speed layer verdicts; calculate AUC, precision, recall
+- [ ] Document results in `README.md` benchmark table
+
+**Phase 2.5 exit criteria:**
+- [ ] `FftMlp` and `extract_faces.py` and `train_vision.py` all committed
+- [ ] Training completes without OOM on RTX 4050 (6GB VRAM)
+- [ ] Vision Service loads trained weights on startup (logged: `Loaded FftMlp weights`)
+- [ ] Speed layer deepfake score clearly differentiates between real and fake FF++ test videos
+- [ ] README benchmark table populated with val/test accuracy
+
+---
+
 ## Phase 3 — Performance & Scalability
 
 **Goal:** Handle multiple concurrent streams reliably.
