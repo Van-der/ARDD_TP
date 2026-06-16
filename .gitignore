@@ -1,8 +1,7 @@
-# Environment variables (keep .env.example in repo)
+# Environment variables (.env.example is intentionally tracked as a secrets template)
 .env
 .env.local
 .env.*.local
-.env.* 
 # Test dataset
 test_dataset/
 
