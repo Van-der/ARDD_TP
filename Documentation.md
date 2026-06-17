@@ -311,3 +311,70 @@ These files must be created/modified before training begins:
 ### Status
 
 Pipeline MVP fully working end-to-end with real FF++ videos. Speed layer training design locked (15 decisions). Pre-training file checklist documented. Next: write `extract_faces.py` → `train_vision.py` → update `vision-service/` → run training on RTX 4050.
+
+---
+
+## Session: 2026-06-17 — Phase 2.5 Implementation & Training
+
+### Work Completed
+
+#### Phase 2.5 Files Written
+
+- **`vision-service/modeling.py`** (new) — single source of truth for both training and inference. Exports `compute_fft_features()` (64-dim radial FFT bins, normalised), `SpatialBranch` (EfficientNet-B4 + sigmoid head), `FftMlp` (Linear 64→32, ReLU, Dropout 0.3, Linear 32→1, Sigmoid), and `IMAGENET_MEAN` / `IMAGENET_STD` constants. Importing from one file guarantees train/inference distribution parity.
+
+- **`extract_faces.py`** (new, repo root) — offline MTCNN face crop extraction from FF++ c23 videos. Scans both `original_sequences/youtube/c23/videos/` and `manipulated_sequences/Deepfakes/c23/videos/`. Samples every 5th frame (`--frame-step 5`). Crops resized to 380×380 JPEG under `face_crops/{real,fake}/<stem>/frame_NNNNNN.jpg`. Requires `facenet-pytorch`; run inside `ardd_tp-vision-service` Docker container (Python 3.14 host incompatible). Result: **204,351 crops** — 102,211 real + 102,140 fake across 1000 dirs each.
+
+- **`train_vision.py`** (new, repo root) — trains `SpatialBranch` and `FftMlp` simultaneously: one DataLoader, two optimisers, two AMP GradScalers. Weighted BCE loss (`fake_weight=2.0`). Official FF++ split 72%/14%/14% by video dirs. Fits `sklearn.LogisticRegression` fusion on val set; saves all three artifacts to `model-weights/`.
+
+- **`vision-service/main.py`** (rewritten) — loads `SpatialBranch`, `FftMlp`, and fusion params from `model-weights/` volume mounts. Critical fix: ImageNet normalisation now applied at inference (was completely absent — train/inference mismatch). FFT computed on face crop (not full frame), matching training distribution. `fuse()` uses learned logistic regression coefficients when available, falls back to 0.6/0.4 hardcode. `/health` now reports `spatial_trained`, `fft_mlp_trained`, `fusion_trained` flags.
+
+- **`docker-compose.yml`** (updated) — GPU passthrough added to `vision-service` (`deploy.resources.reservations.devices`). Three volume mounts for weight files from `model-weights/`. `MODEL_WEIGHTS_PATH`, `FFT_MLP_WEIGHTS_PATH`, `FUSION_WEIGHTS_PATH` env vars wired.
+
+#### Training Run — RTX 4050 6GB
+
+Training ran entirely inside the `ardd_tp-vision-service` Docker container to work around Python 3.14 host incompatibility.
+
+**Issues encountered and fixed:**
+
+1. **CUDA OOM at batch=16** — EfficientNet-B4 at 380×380 requires ~5.3 GB; RTX 4050 has 5.66 GB. Fixed: batch=8 + `torch.cuda.amp.GradScaler` (AMP FP16) + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+
+2. **BCELoss unsafe with autocast** — `RuntimeError: binary_cross_entropy and BCELoss are unsafe to autocast`. Fix: forward pass inside `with autocast():`, loss computed **outside** it after casting preds to `.float()`. Pattern applied to both branches.
+
+**Results (FF++ c23, Deepfakes subset, 1000 real + 1000 fake videos):**
+
+| Model | Test Accuracy | Notes |
+|---|---|---|
+| EfficientNet-B4 (spatial) | **99.39%** | 10 epochs, AdamW lr=1e-4, cosine annealing |
+| FFT MLP 64-dim (frequency) | 53.3% | Near-random; c23 compression leaves no frequency artefacts |
+| Fused (logistic regression) | **99.41%** | AUC **0.9987** |
+
+Fusion weights: `sigmoid(10.1361·spatial + 7.0433·freq − 8.8748)`
+
+Saved artifacts:
+- `model-weights/efficientnet_b4_ff++.pt` (71 MB — requires git-lfs: `yay -S git-lfs && git lfs install`)
+- `model-weights/fft_mlp_ff++.pt` (11 KB)
+- `model-weights/fusion_alpha.npy` (140 B)
+
+Vision service health confirmed: `spatial_trained: true`, `fft_mlp_trained: true`, `fusion_trained: true`.
+
+#### References Added
+
+Three BibTeX entries added to `PLAN/REFERENCES.md`: FaceForensics (2018), FaceForensics++ ICCV 2019, Google/JigSaw DFDC 2019.
+
+#### Documentation Updates
+
+- `README.md` — updated Scoring Algorithm section with learned fusion weights; added Benchmark Results table; added Future Scope section (FFT frequency branch: multi-method training, DCT features, contrastive loss).
+- `PLAN/PHASES.md` — Phase 2.5 all steps marked complete except Step 2.5.6 (benchmark eval run).
+- `.gitignore` — added `*.pt` / `!model-weights/*.pt` negation, `checkpoints/`, `face_crops/`, `datasets/`, `download-FaceForensics.py`.
+- `.gitattributes` — added git-lfs tracking for `model-weights/*.pt`.
+- `requirements.txt` — added `scikit-learn`.
+
+### Outstanding Issues
+
+**Aggregation service Kafka consumer crashed (2026-06-17):** At startup, the `start_frames_consumer` asyncio task failed with `KafkaConnectionError` (Kafka not yet ready). The exception was never retrieved and the task did not restart. Consumer group `aggregation-pipeline-group` now shows no active members with 3,400 frame lag. **Fix: `docker compose restart aggregation-service`.**
+
+**WebSocket cycling (cosmetic):** Rapid open/close pattern in UI logs is caused by React StrictMode double-invocation of effects in dev mode (frontend runs `npm run dev` in Docker). Two `/auth/token` requests per cycle are expected; the WebSocket itself is protocol-correct (verified via curl — connection holds for 40s until ping timeout). Resolution options: remove `<StrictMode>` wrapper in `main.tsx`, or build for production.
+
+### Status
+
+Phase 2.5 training complete. All weight files written and loaded by vision-service. Benchmark eval run (Step 2.5.6) pending resolution of aggregation service consumer crash.

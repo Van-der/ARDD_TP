@@ -74,10 +74,23 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_FRAMES=frames
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
-      - MODEL_WEIGHTS_PATH=/app/weights/efficientnet_b4.pth
+      - MODEL_WEIGHTS_PATH=/app/weights/efficientnet_b4_ff++.pt
+      - FFT_MLP_WEIGHTS_PATH=/app/weights/fft_mlp_ff++.pt
+      - FUSION_WEIGHTS_PATH=/app/weights/fusion_alpha.npy
+    volumes:
+      - ./model-weights/efficientnet_b4_ff++.pt:/app/weights/efficientnet_b4_ff++.pt:ro
+      - ./model-weights/fft_mlp_ff++.pt:/app/weights/fft_mlp_ff++.pt:ro
+      - ./model-weights/fusion_alpha.npy:/app/weights/fusion_alpha.npy:ro
     networks:
       - ardd_net
     restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s

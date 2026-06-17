@@ -27,11 +27,51 @@ Local cache: `~/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/`
 
 ## Datasets
 
-| Dataset | Use |
+### FaceForensics (original, 2018)
+
+```bibtex
+@article{roessler2018faceforensics,
+  author  = {Andreas R{\"o}ssler and Davide Cozzolino and Luisa Verdoliva
+             and Christian Riess and Justus Thies and Matthias Nie{\ss}ner},
+  title   = {Face{F}orensics: A Large-scale Video Dataset for Forgery Detection in Human Faces},
+  journal = {arXiv},
+  year    = {2018}
+}
+```
+
+### FaceForensics++ (ICCV 2019)
+
+```bibtex
+@inproceedings{roessler2019faceforensicspp,
+  author    = {Andreas R{\"o}ssler and Davide Cozzolino and Luisa Verdoliva
+               and Christian Riess and Justus Thies and Matthias Nie{\ss}ner},
+  title     = {Face{F}orensics++: Learning to Detect Manipulated Facial Images},
+  booktitle = {International Conference on Computer Vision (ICCV)},
+  year      = {2019}
+}
+```
+
+Used as the primary training and evaluation dataset for the Speed Layer (Phase 2.5). c23 compression, Deepfakes manipulation subset. Official split: 720 train / 140 val / 140 test videos. Access via official request form.
+
+### DeepFakes Detection Dataset — Google & JigSaw (2019)
+
+```bibtex
+@misc{DDD_GoogleJigSaw2019,
+  author = {Dufour, Nicholas and Gully, Andrew and Karlsson, Per and
+            Vorbyov, Alexey Victor and Leung, Thomas and Childs, Jeremiah
+            and Bregler, Christoph},
+  date   = {2019-09},
+  title  = {DeepFakes Detection Dataset by Google \& JigSaw}
+}
+```
+
+Referenced as a cross-dataset generalisation benchmark.
+
+| Dataset | Use in ARDD-TP |
 |---|---|
-| FaceForensics++ | Standard benchmark for deepfake detection evaluation |
+| FaceForensics++ (c23, Deepfakes) | Speed Layer training + evaluation (Phase 2.5) |
 | Celeb-DF | Cross-dataset generalisation reference |
-| DFDC (DeepFake Detection Challenge) | Temporal model pre-training reference |
+| DFDC (Google/JigSaw) | Cross-dataset generalisation reference |
 
 ---
 

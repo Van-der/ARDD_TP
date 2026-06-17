@@ -32,11 +32,15 @@ Thumbs.db
 tmp/
 temp/
 
-# Model weights (large files)
+# Model weights (large files) — use git-lfs for .pt files in model-weights/
 *.pth
-*.pt
 *.h5
-*.pkl
+# Ignore *.pt everywhere EXCEPT model-weights/ (see negation below)
+*.pt
+!model-weights/*.pt
+
+# Training checkpoints (intermediate, not committed)
+checkpoints/
 
 # Database files
 *.db
@@ -62,6 +66,5 @@ download-FaceForensics.py
 # FaceForensics++ dataset (large files)
 datasets/
 
-# Training artifacts
-checkpoints/
+# Training artifacts (face_crops/ is large and not committed)
 face_crops/

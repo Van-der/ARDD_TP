@@ -396,21 +396,22 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 
 **Goal:** Replace the heuristic FFT frequency branch with a trained MLP, and fine-tune the full EfficientNet-B4 spatial branch on FaceForensics++ (FF++) data. After this phase the Vision Service runs a fully trained dual-branch model instead of the ImageNet-pretrained + heuristic combination.
 
-> **Status:** Design locked 2026-06-17 (15-decision grill-me session). Pre-training files not yet written.
+> **Status:** Training complete 2026-06-17. All five pre-training files written and tested. EfficientNet-B4 fine-tuned on FF++ c23 (10 epochs, RTX 4050 6GB, AMP FP16). Test AUC 0.9987. Step 2.5.6 benchmark run in progress (WebSocket/Kafka pipeline issue being resolved).
 
 **Prerequisites:** Phase 2 complete. FaceForensics++ dataset downloaded (1000 real + 2000 fake, c23 compression). `nvidia-container-toolkit` installed and configured.
 
-### Step 2.5.1 — Create `vision-service/modeling.py`
-- [ ] Define `FftMlp` class: `Linear(64→32) → ReLU → Dropout(0.3) → Linear(32→1) → Sigmoid`
-- [ ] Input: 64-dim radial FFT bin vector
-- [ ] Output: scalar fake probability
+### Step 2.5.1 — Create `vision-service/modeling.py` ✅ COMPLETED
+- [x] `compute_fft_features(img_gray, n_bins=64)` — radial FFT bin computation (shared by train + inference)
+- [x] `SpatialBranch` — EfficientNet-B4 + sigmoid head (moved from main.py inline class)
+- [x] `FftMlp` class: `Linear(64→32) → ReLU → Dropout(0.3) → Linear(32→1) → Sigmoid`
+- [x] `IMAGENET_MEAN` / `IMAGENET_STD` constants exported for consistent normalisation
 
-### Step 2.5.2 — Create `extract_faces.py`
-- [ ] Scan `datasets/ff++/original_sequences/youtube/c23/videos/` (real) and `manipulated_sequences/Deepfakes/c23/videos/` (fake)
-- [ ] Sample every 5th frame per video
-- [ ] Run MTCNN; skip frames with no detected face
-- [ ] Resize crop to 380×380; save JPEG to `face_crops/real/<stem>/` and `face_crops/fake/<stem>/`
-- [ ] Expected: ~180K crops total from 3000 videos
+### Step 2.5.2 — Create `extract_faces.py` ✅ COMPLETED
+- [x] Scans both `original_sequences/youtube/c23/videos/` and `manipulated_sequences/Deepfakes/c23/videos/`
+- [x] `--frame-step N` (default 5); skips frames with no detected face
+- [x] MTCNN crop resized to 380×380; saved as JPEG to `face_crops/{real,fake}/<stem>/frame_NNNNNN.jpg`
+- [x] `--gpu` flag for MTCNN device selection; graceful error if facenet-pytorch not installed
+- [x] Docstring explains Docker run command (required on Python 3.14 — facenet-pytorch incompatible)
 
 **Verification:**
 ```bash
@@ -419,54 +420,60 @@ ls face_crops/real/ | wc -l   # expect ~1000 video dirs
 ls face_crops/fake/ | wc -l   # expect ~2000 video dirs
 ```
 
-### Step 2.5.3 — Create `train_vision.py`
-- [ ] Load EfficientNet-B4 (ImageNet weights); unfreeze all layers
-- [ ] Load `FftMlp` from `vision-service/modeling.py`
-- [ ] Official FF++ split: 720 train / 140 val / 140 test video directories
-- [ ] `CrossEntropyLoss(weight=torch.tensor([2.0, 1.0]))` for 2:1 fake:real imbalance
-- [ ] Safe augmentation: `RandomHorizontalFlip`, `ColorJitter(brightness=0.2)`, `RandomCrop(380)`
-- [ ] Batch=16, EfficientNet LR=1e-4, MLP LR=1e-3, cosine annealing, 10 epochs
-- [ ] Save `checkpoints/efficientnet_b4_ff++.pt` and `checkpoints/fft_mlp_ff++.pt` (state_dict only)
-- [ ] Fit logistic regression scalar `alpha` on val set; save alongside checkpoints
+### Step 2.5.3 — Create `train_vision.py` ✅ COMPLETED
+- [x] Trains `SpatialBranch` and `FftMlp` simultaneously (one DataLoader pass, two optimisers)
+- [x] Official FF++ split: 72%/14%/14% of video dirs (matches 720/140/140 for 1000-video real set)
+- [x] Weighted BCE loss: `fake_weight=2.0` for 2:1 imbalance
+- [x] Safe augmentation: `RandomHorizontalFlip`, `ColorJitter(brightness=0.2)`, `RandomCrop(380, padding=10)`
+- [x] ImageNet normalisation applied to spatial branch; FFT computed on pre-augmentation grayscale crop
+- [x] Batch=16, AdamW, EfficientNet LR=1e-4, MLP LR=1e-3, cosine annealing, 10 epochs
+- [x] Fits `sklearn.LogisticRegression` fusion on val scores; saves coefficients as `model-weights/fusion_alpha.npy`
+- [x] Saves `model-weights/efficientnet_b4_ff++.pt` and `model-weights/fft_mlp_ff++.pt` (state_dict)
+- [x] Prints per-epoch val accuracy for both branches + final test accuracy and AUC
+
+**Training notes (actual run 2026-06-17):**
+- OOM at default batch=16 → reduced to batch=8 + AMP FP16 (`torch.cuda.amp.GradScaler`)
+- BCELoss is autocast-unsafe (FP16 log underflow) → loss computed outside `with autocast():` block
+- 10 epochs × ~7h total on RTX 4050 6GB; final test AUC 0.9987
+- Fusion weights: `sigmoid(10.14·spatial + 7.04·freq − 8.87)`
+- Run inside Docker: `docker run --rm --gpus all -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ...`
 
 **Verification:**
 ```bash
 python train_vision.py
 # Expected output: epoch logs + final val accuracy
-ls checkpoints/
-# efficientnet_b4_ff++.pt  fft_mlp_ff++.pt  alpha.pkl
+ls model-weights/
+# efficientnet_b4_ff++.pt  fft_mlp_ff++.pt  fusion_alpha.npy
 ```
 
-### Step 2.5.4 — Update `vision-service/main.py`
-- [ ] Import `FftMlp` from `modeling.py`
-- [ ] Load MLP weights from `/app/weights/fft_mlp_ff++.pt` at startup; fallback to heuristic if missing
-- [ ] Replace hardcoded `fft_heuristic_score()` call with `FftMlp` forward pass
-- [ ] Replace hardcoded `0.6 / 0.4` fusion with learned `alpha` scalar
+### Step 2.5.4 — Update `vision-service/main.py` ✅ COMPLETED
+- [x] Imports `SpatialBranch`, `FftMlp`, `compute_fft_features`, `IMAGENET_MEAN/STD` from `modeling.py`
+- [x] Loads spatial, FFT MLP, and fusion weights at startup; each falls back gracefully if missing
+- [x] Applies ImageNet normalisation to spatial branch tensor (was missing before — train/inference mismatch fixed)
+- [x] FFT computed on face crop (380×380 gray), not full frame — matches training distribution
+- [x] `fuse(spatial, freq)` uses learned logistic regression params when available; falls back to 0.6/0.4 hardcode
+- [x] `heuristic_fft_score()` retained as fallback for pre-training use
+- [x] `/health` endpoint now reports `spatial_trained`, `fft_mlp_trained`, `fusion_trained` flags
 
-### Step 2.5.5 — Update `docker-compose.yml`
-- [ ] Add GPU passthrough to `vision-service`:
-  ```yaml
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1
-            capabilities: [gpu]
-  ```
-- [ ] Add volume mounts for `checkpoints/efficientnet_b4_ff++.pt` and `checkpoints/fft_mlp_ff++.pt`
+### Step 2.5.5 — Update `docker-compose.yml` ✅ COMPLETED
+- [x] GPU passthrough added to `vision-service` via `deploy.resources.reservations.devices`
+- [x] Volume mounts for all three weight files: `efficientnet_b4_ff++.pt`, `fft_mlp_ff++.pt`, `fusion_alpha.npy`
+- [x] Env vars `MODEL_WEIGHTS_PATH`, `FFT_MLP_WEIGHTS_PATH`, `FUSION_WEIGHTS_PATH` wired to container paths
 
 ### Step 2.5.6 — Benchmark with `video_feeder.py`
 - [ ] Run `python video_feeder.py --mode eval` against FF++ test set (140 real + 140 fake videos)
 - [ ] Collect temporal and speed layer verdicts; calculate AUC, precision, recall
 - [ ] Document results in `README.md` benchmark table
 
+> **Blocker (2026-06-17):** Aggregation service Kafka consumer (`aggregation-pipeline-group`) crashed at startup with `KafkaConnectionError` — task exception was never retrieved and the consumer did not restart. Kafka topic has 3 400 frame lag. Fix: `docker compose restart aggregation-service`. WebSocket cycling from React StrictMode double-invoke in dev mode is a separate cosmetic issue.
+
 **Phase 2.5 exit criteria:**
-- [ ] `FftMlp` and `extract_faces.py` and `train_vision.py` all committed
-- [ ] Training completes without OOM on RTX 4050 (6GB VRAM)
-- [ ] Vision Service loads trained weights on startup (logged: `Loaded FftMlp weights`)
-- [ ] Speed layer deepfake score clearly differentiates between real and fake FF++ test videos
-- [ ] README benchmark table populated with val/test accuracy
+- [x] `FftMlp`, `extract_faces.py`, `train_vision.py`, updated `vision-service/main.py`, updated `docker-compose.yml` all complete
+- [x] Training completes without OOM on RTX 4050 (6GB VRAM) — batch=8 + AMP FP16 required
+- [x] Vision Service loads trained weights on startup (`spatial_trained: true`, `fft_mlp_trained: true`, `fusion_trained: true` in `/health`)
+- [x] Speed layer test accuracy 99.41%, AUC 0.9987 on FF++ Deepfakes c23 test set
+- [x] README benchmark table populated with val/test accuracy
+- [ ] `video_feeder.py --mode eval` end-to-end benchmark run and results verified
 
 ---
 

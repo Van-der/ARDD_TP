@@ -25,6 +25,9 @@ PyJWT
 # ML tracking
 mlflow
 
+# Training (Phase 2.5)
+scikit-learn
+
 # Load testing
 locust
 

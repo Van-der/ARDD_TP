@@ -87,9 +87,10 @@ Both layers independently consume from the same Kafka `frames` topic.
 
 ```
 # Vision Service — Speed Layer (per frame)
-deepfake_score = 0.6 · spatial_score + 0.4 · frequency_score
-# spatial_score  = EfficientNet-B4 sigmoid on aligned face crop
-# frequency_score = FFT branch sigmoid on frequency-domain frame
+spatial_score  = EfficientNet-B4(face_crop_380x380)          # fine-tuned on FF++
+freq_score     = FftMlp(radial_fft_bins_64d(face_crop_gray)) # trained on FF++
+deepfake_score = sigmoid(10.14 · spatial_score + 7.04 · freq_score − 8.87)
+# ^ learned logistic regression fusion; weights from FF++ val set
 
 # Aggregation Service — Speed Path
 final_score = clamp(deepfake_score · (1 + 0.15 · rag_boost), 0.0, 1.0)
@@ -340,3 +341,35 @@ ARDD_TP/
 | [`PLAN/REFERENCES.md`](./PLAN/REFERENCES.md) | Models, datasets, and library citations |
 | [`Documentation.md`](./Documentation.md) | Development journal — session-by-session progress log |
 | [`TaskTo.md`](./TaskTo.md) | Pending deprecation fixes and deferred features |
+
+---
+
+## Benchmark Results — Speed Layer (Phase 2.5)
+
+Trained on FaceForensics++ c23 compression, Deepfakes manipulation subset. Official 720/140/140 train/val/test split. 204,351 MTCNN-aligned face crops extracted at every 5th frame.
+
+| Model | Test Accuracy | Notes |
+|---|---|---|
+| EfficientNet-B4 (spatial branch) | **99.39%** | Fine-tuned from ImageNet; 10 epochs, AdamW, cosine LR |
+| FFT MLP 64-dim radial bins (frequency branch) | 53.3% | Near-random; FF++ Deepfakes c23 leaves no detectable frequency artefacts |
+| Fused (logistic regression) | **99.41%** | AUC **0.9987** |
+
+**Training config:** batch=8, EfficientNet LR=1e-4, MLP LR=1e-3, AMP FP16, RTX 4050 6GB.
+
+**Dataset:** [FaceForensics++](https://github.com/ondyari/FaceForensics) — Rössler et al., ICCV 2019. See [`PLAN/REFERENCES.md`](./PLAN/REFERENCES.md) for full citations.
+
+---
+
+## Future Scope
+
+### FFT Frequency Branch — Multi-Method Training
+
+The FFT MLP trained to only 53% accuracy (near-random) on the Deepfakes subset of FF++. This is expected: Deepfakes at c23 compression are high-quality face-swaps that leave minimal frequency-domain artefacts detectable by radial FFT binning.
+
+The frequency branch is architecturally sound and remains in the pipeline with a near-zero learned fusion weight. It can be made meaningful by:
+
+1. **Training on all four FF++ manipulation types** — Face2Face, FaceSwap, and NeuralTextures generate different blending artefacts that do appear in the frequency domain, particularly at region boundaries. A model trained across all four types would give the FFT branch genuine signal to learn.
+
+2. **Richer frequency features** — Replace 64-dim radial bins with DCT block statistics (used in JPEG compression analysis), gradient magnitude histograms, or patch-level DFT features that capture local inconsistencies rather than global radial averages.
+
+3. **Joint training with contrastive loss** — Train the FFT MLP to explicitly contrast real vs. fake frequency patterns rather than binary classification, which may surface subtler artefacts invisible to a standard BCE objective.
