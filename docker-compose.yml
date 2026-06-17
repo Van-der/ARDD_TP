@@ -109,7 +109,7 @@ services:
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - OLLAMA_HOST=http://ollama:11434
-      - MOCK_LLM=${MOCK_LLM:-true}
+      - MOCK_LLM=false
     networks:
       - ardd_net
     restart: unless-stopped
@@ -206,17 +206,18 @@ services:
       retries: 3
 
   ollama:
-    image: ollama/ollama:0.1.32
+    image: ollama/ollama:latest
     container_name: ollama
     expose:
       - "11434"
     volumes:
-      - ./ollama-data:/root/.ollama
+      # Mount host system Ollama model store (blobs + manifests) into the container.
+      # Host stores models at /var/lib/ollama/{blobs,manifests}; container expects
+      # them under /root/.ollama/models/{blobs,manifests}.
+      - /var/lib/ollama:/root/.ollama/models:ro
     networks:
       - ardd_net
     restart: unless-stopped
-    # After first start, pull the model:
-    # docker exec ollama ollama pull mistral
 
   frontend:
     build:

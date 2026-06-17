@@ -140,59 +140,66 @@ def process_labeled_result(result: dict, label: str):
 async def start_labels_consumer():
     if os.getenv("TESTING"):
         return
-    consumer = AIOKafkaConsumer(
-        os.getenv("KAFKA_TOPIC_LABELS", "labels"),
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id="aggregation-labels-group",
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        **_kafka_sasl_kwargs()
-    )
-    await consumer.start()
-    try:
-        async for msg in consumer:
-            label_data = msg.value
-            stream_id = label_data.get("stream_id")
-            frame_index = label_data.get("frame_index")
-            label = label_data.get("label")
-            if not stream_id or frame_index is None or not label:
-                continue
-            
-            key = f"{stream_id}_{frame_index}"
-            if key in results_buffer:
-                result = results_buffer.pop(key)
-                process_labeled_result(result, label)
-            else:
-                labels_buffer[key] = label_data
-                if len(labels_buffer) > MAX_LABELS_BUFFER:
-                    oldest_key = next(iter(labels_buffer))
-                    del labels_buffer[oldest_key]
-    except Exception as e:
-        logger.error(f"Kafka labels consumer error: {e}")
-    finally:
-        await consumer.stop()
+    while True:
+        try:
+            consumer = AIOKafkaConsumer(
+                os.getenv("KAFKA_TOPIC_LABELS", "labels"),
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                group_id="aggregation-labels-group",
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                **_kafka_sasl_kwargs()
+            )
+            await consumer.start()
+            logger.info("Labels consumer started.")
+            try:
+                async for msg in consumer:
+                    label_data = msg.value
+                    stream_id = label_data.get("stream_id")
+                    frame_index = label_data.get("frame_index")
+                    label = label_data.get("label")
+                    if not stream_id or frame_index is None or not label:
+                        continue
+                    key = f"{stream_id}_{frame_index}"
+                    if key in results_buffer:
+                        result = results_buffer.pop(key)
+                        process_labeled_result(result, label)
+                    else:
+                        labels_buffer[key] = label_data
+                        if len(labels_buffer) > MAX_LABELS_BUFFER:
+                            oldest_key = next(iter(labels_buffer))
+                            del labels_buffer[oldest_key]
+            finally:
+                await consumer.stop()
+        except Exception as e:
+            logger.error(f"Labels consumer crashed: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
 
 async def start_frames_consumer():
     if os.getenv("TESTING"):
         return
-    consumer = AIOKafkaConsumer(
-        "frames",
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id="aggregation-pipeline-group",
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        **_kafka_sasl_kwargs()
-    )
-    await consumer.start()
-    try:
-        async for msg in consumer:
+    while True:
+        try:
+            consumer = AIOKafkaConsumer(
+                "frames",
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                group_id="aggregation-pipeline-group",
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                **_kafka_sasl_kwargs()
+            )
+            await consumer.start()
+            logger.info("Frames consumer started.")
             try:
-                payload = FramePayload(**msg.value)
-                await process_frame_payload(payload)
-            except Exception as e:
-                logger.error(f"Pipeline error processing frame: {e}")
-    except Exception as e:
-        logger.error(f"Kafka frames consumer error: {e}")
-    finally:
-        await consumer.stop()
+                async for msg in consumer:
+                    try:
+                        payload = FramePayload(**msg.value)
+                        await process_frame_payload(payload)
+                    except Exception as e:
+                        logger.error(f"Pipeline error processing frame: {e}")
+            finally:
+                await consumer.stop()
+        except Exception as e:
+            logger.error(f"Frames consumer crashed: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
 
 async def mlflow_flush_task():
     while True:

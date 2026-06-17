@@ -176,33 +176,37 @@ async def run_inference_and_flush(stream_id: str):
 async def frames_consumer_task():
     if os.getenv("TESTING"):
         return
-    consumer = AIOKafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id="temporal-service-group",
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        **_kafka_sasl_kwargs()
-    )
-    await consumer.start()
-    try:
-        async for msg in consumer:
-            data = msg.value
-            stream_id = data.get("stream_id")
-            frame_index = data.get("frame_index", 0)
-            payload_b64 = data.get("payload")
-            if not stream_id or not payload_b64:
-                continue
-
+    while True:
+        try:
+            consumer = AIOKafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                group_id="temporal-service-group",
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                **_kafka_sasl_kwargs()
+            )
+            await consumer.start()
+            logger.info("Temporal frames consumer started.")
             try:
-                tensor = process_frame(payload_b64)
-                stream_buffers[stream_id].append((frame_index, tensor))
-                
-                if len(stream_buffers[stream_id]) == TARGET_FRAMES:
-                    await run_inference_and_flush(stream_id)
-            except Exception as e:
-                logger.error(f"Error processing frame for {stream_id}: {e}")
-    finally:
-        await consumer.stop()
+                async for msg in consumer:
+                    data = msg.value
+                    stream_id = data.get("stream_id")
+                    frame_index = data.get("frame_index", 0)
+                    payload_b64 = data.get("payload")
+                    if not stream_id or not payload_b64:
+                        continue
+                    try:
+                        tensor = process_frame(payload_b64)
+                        stream_buffers[stream_id].append((frame_index, tensor))
+                        if len(stream_buffers[stream_id]) == TARGET_FRAMES:
+                            await run_inference_and_flush(stream_id)
+                    except Exception as e:
+                        logger.error(f"Error processing frame for {stream_id}: {e}")
+            finally:
+                await consumer.stop()
+        except Exception as e:
+            logger.error(f"Temporal frames consumer crashed: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup_event():

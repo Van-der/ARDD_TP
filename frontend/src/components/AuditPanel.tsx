@@ -57,8 +57,17 @@ export const AuditPanel = () => {
               {renderVerdictBadge(latestTemporalAudit.temporal_verdict)}
             </div>
             <div className="flex-row justify-between">
-              <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Continuity Score</span>
-              <span style={{ fontWeight: 600 }}>{((1 - latestTemporalAudit.temporal_score) * 100).toFixed(1)}%</span>
+              <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Authenticity Confidence</span>
+              <span style={{
+                fontWeight: 600,
+                color: (1 - latestTemporalAudit.temporal_score) >= 0.6
+                  ? 'var(--success)'
+                  : (1 - latestTemporalAudit.temporal_score) >= 0.4
+                  ? 'var(--warning)'
+                  : 'var(--danger)'
+              }}>
+                {((1 - latestTemporalAudit.temporal_score) * 100).toFixed(1)}% confident real
+              </span>
             </div>
             
             {latestTemporalAudit.low_confidence_flag && (
@@ -75,10 +84,13 @@ export const AuditPanel = () => {
       </div>
       {/* Verdict Tally */}
       <div className="card flex-col gap-3">
-        <div className="flex-row justify-between" style={{ alignItems: 'center' }}>
-          <div className="flex-row gap-2" style={{ color: 'var(--text-secondary)' }}>
-            <BarChart2 size={18} />
-            <h3 style={{ fontSize: '1rem' }}>Temporal Verdict Tally</h3>
+        <div className="flex-row justify-between" style={{ alignItems: 'flex-start' }}>
+          <div className="flex-col gap-1">
+            <div className="flex-row gap-2" style={{ color: 'var(--text-secondary)' }}>
+              <BarChart2 size={18} />
+              <h3 style={{ fontSize: '1rem' }}>Temporal Verdict Tally</h3>
+            </div>
+            <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', paddingLeft: '26px' }}>20-frame sequence windows</span>
           </div>
           <button
             onClick={resetVerdictCounts}
@@ -91,15 +103,15 @@ export const AuditPanel = () => {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem' }}>
           <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(34,197,94,0.08)', borderRadius: '8px', border: '1px solid rgba(34,197,94,0.2)' }}>
             <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--success)' }}>{verdictCounts.PASS}</div>
-            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>REAL</div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>Real windows</div>
           </div>
           <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(239,68,68,0.08)', borderRadius: '8px', border: '1px solid rgba(239,68,68,0.2)' }}>
             <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--danger)' }}>{verdictCounts.FAIL}</div>
-            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>FAKE</div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>Fake windows</div>
           </div>
           <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(107,114,128,0.08)', borderRadius: '8px', border: '1px solid rgba(107,114,128,0.2)' }}>
             <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-muted)' }}>{verdictCounts.UNKNOWN}</div>
-            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>UNKNOWN</div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>Unknown</div>
           </div>
         </div>
 

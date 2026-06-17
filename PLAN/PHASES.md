@@ -465,7 +465,7 @@ ls model-weights/
 - [ ] Collect temporal and speed layer verdicts; calculate AUC, precision, recall
 - [ ] Document results in `README.md` benchmark table
 
-> **Blocker (2026-06-17):** Aggregation service Kafka consumer (`aggregation-pipeline-group`) crashed at startup with `KafkaConnectionError` — task exception was never retrieved and the consumer did not restart. Kafka topic has 3 400 frame lag. Fix: `docker compose restart aggregation-service`. WebSocket cycling from React StrictMode double-invoke in dev mode is a separate cosmetic issue.
+> **Note:** Both `aggregation-service` and `temporal-service` Kafka consumer tasks now have a retry loop (2026-06-18 fix) — if Kafka is not ready at startup the consumer retries every 5s automatically. `<StrictMode>` removed from frontend — WebSocket cycling issue resolved.
 
 **Phase 2.5 exit criteria:**
 - [x] `FftMlp`, `extract_faces.py`, `train_vision.py`, updated `vision-service/main.py`, updated `docker-compose.yml` all complete

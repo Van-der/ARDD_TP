@@ -2,18 +2,21 @@
 """
 FF++ Video Feeder — publishes real FaceForensics++ frames to Kafka.
 
-Two modes:
+Three modes:
   demo   Alternates between one real and one fake video every --switch-every
          seconds. Watch the dashboard live as the Temporal Audit flips.
   eval   Streams all real videos then all fake videos sequentially,
          printing ground-truth labels so you can compare against scores.
+  mix    Interleaves 20-frame blocks of real and fake on a SINGLE stream_id
+         ("ff_mix"). Each block exactly fills one temporal window, so the
+         Temporal Audit flips cleanly between Authentic/Fake every ~2s at 10 FPS.
 
 Usage:
   # Demo (default, 15s per video):
   python video_feeder.py
 
-  # Demo with custom switch interval:
-  python video_feeder.py --mode demo --switch-every 20
+  # Mix mode — best for testing dashboard with both verdicts on one stream:
+  python video_feeder.py --mode mix --fps 10
 
   # Full evaluation run:
   python video_feeder.py --mode eval --fps 10
@@ -143,6 +146,81 @@ def run_demo(fps: int, switch_every: int) -> None:
         producer.close()
 
 
+def run_mix(fps: int) -> None:
+    """Send alternating 20-frame blocks of real/fake on the same stream_id.
+
+    Each block = exactly one temporal window. At 10 FPS the pattern flips every 2s,
+    so you'll see the Temporal Verdict Tally increment on both REAL and FAKE sides.
+    """
+    real_videos = sorted(REAL_DIR.glob("*.mp4"))
+    fake_videos = sorted(FAKE_DIR.glob("*.mp4"))
+
+    if not real_videos or not fake_videos:
+        print("[ERROR] No videos found. Check datasets/ff++ structure.")
+        return
+
+    producer = make_producer()
+    interval = 1.0 / fps
+    stream_id = "ff_mix"
+    frame_index = 0
+    real_idx = fake_idx = 0
+
+    print(f"Mix mode — alternating 20-frame blocks at {fps} FPS on stream '{stream_id}'")
+    print("Temporal window fires every 20 frames → verdict flips ~every 2s.\n")
+    print("  Ctrl-C to stop.\n")
+
+    def open_cap(path: Path) -> cv2.VideoCapture:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open {path}")
+        return cap
+
+    try:
+        while True:
+            for label, videos, idx_ref in [
+                ("REAL", real_videos, [real_idx]),
+                ("FAKE", fake_videos, [fake_idx]),
+            ]:
+                video_path = videos[idx_ref[0] % len(videos)]
+                cap = open_cap(video_path)
+                sent = 0
+                print(f"  [{label}] {video_path.name}")
+
+                while sent < 20:
+                    ret, frame = cap.read()
+                    if not ret:
+                        # loop the video if it runs out before 20 frames
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+
+                    _, buf = cv2.imencode(".jpg", frame)
+                    producer.send(KAFKA_TOPIC, {
+                        "stream_id": stream_id,
+                        "frame_index": frame_index,
+                        "timestamp_ms": int(time.time() * 1000),
+                        "payload": base64.b64encode(buf.tobytes()).decode("utf-8"),
+                    })
+                    frame_index += 1
+                    sent += 1
+                    sys.stdout.write(f"\r    frame {frame_index:5d}  block {sent:2d}/20")
+                    sys.stdout.flush()
+                    time.sleep(interval)
+
+                cap.release()
+                idx_ref[0] += 1
+
+            real_idx += 1
+            fake_idx += 1
+            print()  # newline after \r
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        producer.close()
+
+
 def run_eval(fps: int) -> None:
     real_videos = sorted(REAL_DIR.glob("*.mp4"))
     fake_videos = sorted(FAKE_DIR.glob("*.mp4"))
@@ -176,7 +254,7 @@ def run_eval(fps: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FF++ Video Feeder for ARDD-TP")
-    parser.add_argument("--mode", choices=["demo", "eval"], default="demo")
+    parser.add_argument("--mode", choices=["demo", "eval", "mix"], default="demo")
     parser.add_argument("--fps", type=int, default=10,
                         help="Frames per second to publish (default: 10)")
     parser.add_argument("--switch-every", type=int, default=15,
@@ -192,6 +270,8 @@ def main() -> None:
 
     if args.mode == "demo":
         run_demo(fps=args.fps, switch_every=args.switch_every)
+    elif args.mode == "mix":
+        run_mix(fps=args.fps)
     else:
         run_eval(fps=args.fps)
 

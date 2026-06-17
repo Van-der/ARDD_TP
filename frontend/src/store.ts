@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 export interface FrameData {
+  stream_id: string;
   frame_index: number;
   timestamp_ms: number;
   deepfake_score: number;
@@ -37,6 +38,9 @@ interface AppState {
   addFrame: (frame: FrameData) => void;
   clearFrames: () => void;
 
+  // Flagged frames (deepfake_score > 0.5), last 30 kept
+  flaggedFrames: FrameData[];
+
   // Audits
   latestTemporalAudit: TemporalAudit | null;
   setTemporalAudit: (audit: TemporalAudit) => void;
@@ -45,9 +49,10 @@ interface AppState {
   verdictCounts: VerdictCounts;
   resetVerdictCounts: () => void;
 
-  // Alerts
+  // Alerts — sticky: fires on first alert frame, stays until dismissed
   activeAlert: boolean;
-  setActiveAlert: (status: boolean) => void;
+  alertConsecutiveCount: number;
+  dismissAlert: () => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -60,16 +65,19 @@ export const useStore = create<AppState>((set) => ({
   setConnectionError: (connectionError) => set({ connectionError }),
 
   frames: [],
+  flaggedFrames: [],
   addFrame: (frame) => set((state) => {
     const newFrames = [...state.frames, frame];
-    // Keep last 100 frames for graph performance
     if (newFrames.length > 100) newFrames.shift();
-    return { 
-      frames: newFrames, 
-      activeAlert: frame.alert 
-    };
+    const newFlagged = frame.deepfake_score > 0.5
+      ? [...state.flaggedFrames, frame].slice(-30)
+      : state.flaggedFrames;
+    // Sticky alert: once fired, stays until dismissed; count all incoming alert frames
+    const newCount = frame.alert ? state.alertConsecutiveCount + 1 : state.alertConsecutiveCount;
+    const newAlert = state.activeAlert || frame.alert;
+    return { frames: newFrames, flaggedFrames: newFlagged, activeAlert: newAlert, alertConsecutiveCount: newCount };
   }),
-  clearFrames: () => set({ frames: [] }),
+  clearFrames: () => set({ frames: [], flaggedFrames: [] }),
 
   latestTemporalAudit: null,
   setTemporalAudit: (audit) => set((state) => ({
@@ -84,5 +92,6 @@ export const useStore = create<AppState>((set) => ({
   resetVerdictCounts: () => set({ verdictCounts: { PASS: 0, FAIL: 0, UNKNOWN: 0 } }),
 
   activeAlert: false,
-  setActiveAlert: (activeAlert) => set({ activeAlert })
+  alertConsecutiveCount: 0,
+  dismissAlert: () => set({ activeAlert: false, alertConsecutiveCount: 0 })
 }));

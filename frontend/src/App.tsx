@@ -4,6 +4,7 @@ import { useStore } from './store';
 import { LiveGraph } from './components/LiveGraph';
 import { AuditPanel } from './components/AuditPanel';
 import { AlertBanner } from './components/AlertBanner';
+import { FlaggedFrames } from './components/FlaggedFrames';
 import './index.css';
 
 // Read URLs from Vite env vars (set in docker-compose or .env)
@@ -22,7 +23,7 @@ export default function App() {
     connected, setConnected,
     connectionError, setConnectionError,
     addFrame, setTemporalAudit,
-    activeAlert
+    activeAlert, dismissAlert
   } = useStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -157,7 +158,7 @@ export default function App() {
         </div>
       </header>
 
-      {activeAlert && <AlertBanner />}
+      {activeAlert && <AlertBanner onDismiss={dismissAlert} />}
 
       <main style={{ display: 'grid', gridTemplateColumns: '1fr 350px', gap: '1.5rem', marginTop: '2rem' }}>
         <section className="flex-col gap-4">
@@ -165,6 +166,7 @@ export default function App() {
           <div className="glass-panel" style={{ height: '500px', padding: '1rem' }}>
             <LiveGraph />
           </div>
+          <FlaggedFrames />
         </section>
 
         <aside className="flex-col gap-4">

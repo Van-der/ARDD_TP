@@ -371,10 +371,74 @@ Three BibTeX entries added to `PLAN/REFERENCES.md`: FaceForensics (2018), FaceFo
 
 ### Outstanding Issues
 
-**Aggregation service Kafka consumer crashed (2026-06-17):** At startup, the `start_frames_consumer` asyncio task failed with `KafkaConnectionError` (Kafka not yet ready). The exception was never retrieved and the task did not restart. Consumer group `aggregation-pipeline-group` now shows no active members with 3,400 frame lag. **Fix: `docker compose restart aggregation-service`.**
+**Aggregation service Kafka consumer crashed (2026-06-17):** At startup, the `start_frames_consumer` asyncio task failed with `KafkaConnectionError` (Kafka not yet ready). The exception was never retrieved and the task did not restart. Consumer group `aggregation-pipeline-group` now shows no active members with 3,400 frame lag. **Fix: `docker compose restart aggregation-service`.** → Resolved in next session (2026-06-18) with retry loop.
 
-**WebSocket cycling (cosmetic):** Rapid open/close pattern in UI logs is caused by React StrictMode double-invocation of effects in dev mode (frontend runs `npm run dev` in Docker). Two `/auth/token` requests per cycle are expected; the WebSocket itself is protocol-correct (verified via curl — connection holds for 40s until ping timeout). Resolution options: remove `<StrictMode>` wrapper in `main.tsx`, or build for production.
+**WebSocket cycling (cosmetic):** Rapid open/close pattern in UI logs is caused by React StrictMode double-invocation of effects in dev mode (frontend runs `npm run dev` in Docker). → Resolved in next session (2026-06-18) by removing `<StrictMode>`.
 
 ### Status
 
 Phase 2.5 training complete. All weight files written and loaded by vision-service. Benchmark eval run (Step 2.5.6) pending resolution of aggregation service consumer crash.
+
+---
+
+## Session: 2026-06-18 — Pipeline Stability, Dashboard Improvements & Ollama Integration
+
+### Work Completed
+
+#### Pipeline Stability — Kafka Consumer Retry Loop
+
+Both `temporal-service` and `aggregation-service` had a silent failure mode: if Kafka was not yet ready when the container started, the `aiokafka` consumer task crashed with `KafkaConnectionError`, the exception was never retrieved, and the task never restarted. The consumer group showed no active members indefinitely.
+
+Fixed in both services by wrapping the consumer bootstrap in a `while True / await asyncio.sleep(5)` retry loop. The consumer now retries every 5 seconds until Kafka is reachable, then runs normally. Applies to all three consumer coroutines:
+- `temporal-service/main.py` — `frames_consumer_task()`
+- `aggregation-service/main.py` — `start_frames_consumer()` and `start_labels_consumer()`
+
+#### Frontend — WebSocket Stability Fix
+
+Removed `<StrictMode>` from `frontend/src/main.tsx`. React StrictMode in dev mode intentionally double-invokes effects, causing the WebSocket to open and immediately close on every cycle. This prevented `temporal_audit` WebSocket messages from being received, so the Temporal Verdict Tally never incremented. Removing StrictMode stabilised the connection.
+
+#### Dashboard — Flagged Frames Panel
+
+Added `frontend/src/components/FlaggedFrames.tsx` — a scrollable panel below the live graph showing the last 30 frames where `deepfake_score > 0.5`, newest first. Each entry shows stream ID, frame index, a colour-coded score bar (cyan → orange → red at 50/70/90%), and an ALERT badge if the rolling 5-frame alert fired. `flaggedFrames: FrameData[]` added to the Zustand store, populated by `addFrame` without affecting the existing 100-frame graph buffer.
+
+#### Dashboard — Alert Banner Sticky Fix
+
+The alert banner previously mirrored `frame.alert` directly (a boolean per frame from the server), causing it to mount/unmount on every frame as the score fluctuated around the 90% threshold. Replaced with a sticky model:
+- `activeAlert` is set to `true` on the first alert frame and stays `true` until the user clicks ✕ dismiss.
+- `alertConsecutiveCount` increments on every incoming alert frame and is shown in the banner header.
+- `dismissAlert()` action resets both fields.
+- `AlertBanner` now accepts `onDismiss` prop and renders the consecutive count.
+
+#### Dashboard — Graph Hover Tooltip
+
+Replaced the default Recharts tooltip with a custom `CustomTooltip` component in `LiveGraph.tsx`. On hover shows:
+- Deepfake Score (colour-coded: green/orange/red at 50/70/90%)
+- Fusion formula: `sigmoid(10.14·spatial + 7.04·freq − 8.87)`
+- RAG Verdict (PASS / FAIL / UNKNOWN)
+- RAG boost indicator (+15%) when `audit_verdict === 'FAIL'`
+- Alert badge when `alert: true`
+
+#### Dashboard — Label & Naming Fixes
+
+- **Temporal Verdict Tally**: labels changed from "REAL / FAKE / UNKNOWN" to "Real windows / Fake windows / Unknown" with a "20-frame sequence windows" subtitle — clarifies these are window counts not individual frame counts.
+- **Continuity Score** renamed to **Authenticity Confidence** with colour coding (green ≥ 60%, orange 40–60%, red < 40%) and label `"X% confident real"`.
+
+#### `video_feeder.py` — Mix Mode
+
+Added `--mode mix` that sends alternating 20-frame blocks of real and fake frames on a single `stream_id: ff_mix`. Each block exactly fills one temporal window, so the Temporal Audit verdict flips between Authentic and Fake every ~2 seconds at 10 FPS. Useful for verifying the full pipeline (speed layer + batch layer + tally) without needing to wait for a video switch.
+
+#### Ollama Integration — Real Mistral Enabled
+
+Host system Ollama (v0.30.5) has `mistral:latest` (4.4 GB) and `gemma4:e4b` (9.6 GB) installed at `/var/lib/ollama/`. The Docker Ollama container previously used an empty `./ollama-data` volume (no models). Fixed by:
+1. Changed Ollama Docker image from `ollama/ollama:0.1.32` to `ollama/ollama:latest`.
+2. Mounted `/var/lib/ollama:/root/.ollama/models:ro` — the host's `blobs/` and `manifests/` directories match what the container expects under `models/`.
+3. Set `MOCK_LLM=false` in `rag-agent` environment (was `${MOCK_LLM:-true}`).
+4. RAG agent uses `mistral` only (hardcoded at `rag-agent/main.py:147`) — gemma4 is never called.
+
+#### TypeScript Fix
+
+`FrameData` is a TypeScript interface (type-only). Vite 8 (Rolldown bundler) requires `import type` for type-only imports. Fixed `LiveGraph.tsx` to use `import type { FrameData } from '../store'` instead of a value import.
+
+### Status
+
+Full pipeline operational: video_feeder → Kafka → Aggregation (retry) → Vision (trained EfficientNet+FFT) + RAG (real Mistral) → WebSocket → Dashboard (stable, sticky alerts, hover tooltip, flagged frames panel, mix mode). Temporal service also has retry loop and fires verdicts every 20 frames. Benchmark eval run (Step 2.5.6) ready to execute.
