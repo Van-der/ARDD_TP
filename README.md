@@ -183,11 +183,14 @@ docker compose down -v
 
 ### Pull the Ollama LLM Model (one-time, optional)
 
-By default the RAG agent runs in mock mode (`MOCK_LLM=true` in `.env`). To use the real Mistral LLM:
+By default the RAG agent runs in mock mode (`MOCK_LLM=true` in `docker-compose.yml`). The mock returns verdicts in microseconds and is the correct setting for Phase 2/3 — Mistral inference takes 500ms–2s, which always exceeds the 100ms RAG budget and causes every frame to fall back to `audit_verdict=UNKNOWN`.
+
+To use the real Mistral LLM (Phase 4+, requires raising `RAG_TIMEOUT` and using a faster model):
 
 ```bash
 docker exec ollama ollama pull mistral
-# Then set MOCK_LLM=false in .env and restart: docker compose up -d rag-agent
+# Set MOCK_LLM=false in docker-compose.yml and raise RAG_TIMEOUT in aggregation-service/main.py
+# Then: docker compose up -d --build rag-agent aggregation-service
 ```
 
 ---
@@ -203,7 +206,8 @@ ARDD_TP/
 ├── locustfile.py              # Load test definition (Locust)
 ├── prepare_test_dataset.py    # Generates labelled frame samples for tests
 ├── simulate_stream.py         # Publishes synthetic frames to Kafka for local dev
-├── video_feeder.py            # Streams real FF++ videos to Kafka (demo + eval modes)
+├── video_feeder.py            # Streams real FF++ videos to Kafka (demo + eval + mix modes)
+├── run_benchmark.py           # End-to-end Speed Layer benchmark via WebSocket (Phase 2.5.6)
 ├── extract_faces.py           # Offline MTCNN face crop extraction from FF++ videos (Phase 2.5)
 ├── train_vision.py            # EfficientNet-B4 + FFT MLP training script (Phase 2.5)
 ├── test_infrastructure.py     # Smoke-tests that required files and dirs exist
@@ -281,9 +285,10 @@ ARDD_TP/
 │       ├── store.ts           # Zustand state: frames, alerts, JWT, connection status, verdictCounts
 │       ├── store.test.ts
 │       └── components/
-│           ├── AlertBanner.tsx    # Consecutive-alert warning banner
-│           ├── AuditPanel.tsx     # Temporal batch audit results display
-│           └── LiveGraph.tsx      # Real-time deepfake score chart (Recharts)
+│           ├── AlertBanner.tsx    # Consecutive-alert warning banner (sticky, dismissible)
+│           ├── AuditPanel.tsx     # RAG + Temporal audit results; temporal service health wiring
+│           ├── FlaggedFrames.tsx  # Scrollable panel of last 30 frames with score > 0.5
+│           └── LiveGraph.tsx      # Real-time deepfake score chart with hover tooltip (Recharts)
 │
 ├── tests/
 │   └── e2e/
@@ -316,10 +321,11 @@ ARDD_TP/
 |---|---|---|
 | Ingest Gateway | 6 | Kafka publish, FPS downsampling, SASL config |
 | Vision Service | 16 | Spatial branch, frequency branch, score formula, alignment failure, payload limits, auth |
-| RAG Agent | 6 | FAISS search, verdict generation, similarity threshold, auth |
-| Aggregation Service | 22 | Full pipeline, Vision 502, RAG timeout fallback, WebSocket JWT, alert window, drift detection |
-| Temporal Service | 19 | Buffer fill, tensor shape, zero-padding, sparse fallback, full inference, schema validation, auth |
-| **Total** | **69** | **53 pass on host** · vision-service requires Docker (Python 3.14 / facenet-pytorch incompatibility) |
+| RAG Agent | 11 | FAISS search, PASS/UNKNOWN/FAIL verdict zones, similarity threshold, auth, schema |
+| Aggregation Service | 20 | Full pipeline, Vision 502, RAG timeout fallback, WebSocket JWT, alert window, drift detection |
+| Temporal Service | 20 | Buffer fill, tensor shape, zero-padding, gap interpolation, sparse fallback, full inference, schema validation, auth |
+| Frontend | 5 | Zustand store: frame buffer cap, sticky alert, dismissAlert, temporalServiceStatus, token |
+| **Total** | **78** | **62 pass on host** · vision-service requires Docker (Python 3.14 / facenet-pytorch incompatibility) |
 
 ---
 

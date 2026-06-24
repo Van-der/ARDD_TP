@@ -215,18 +215,23 @@ async def mlflow_flush_task():
             for t in items_to_flush:
                 try:
                     with mlflow.start_run(nested=True):
-                        mlflow.log_metrics({
-                            "deepfake_score": t.get("deepfake_score", 0.0),
-                            "temporal_score": t.get("temporal_score", 0.0),
-                            "latency_ms": t.get("latency_ms", 0)
-                        })
-                        mlflow.log_params({
-                            "stream_id": t.get("stream_id", ""),
-                            "frame_index": t.get("frame_index", -1),
-                            "audit_verdict": t.get("audit_verdict", ""),
-                            "temporal_verdict": t.get("temporal_verdict", ""),
-                            "drift_flag": t.get("drift_flag", False)
-                        })
+                        metrics = {"latency_ms": t.get("latency_ms", 0)}
+                        if "deepfake_score" in t:
+                            metrics["deepfake_score"] = t["deepfake_score"]
+                        if "temporal_score" in t:
+                            metrics["temporal_score"] = t["temporal_score"]
+                        mlflow.log_metrics(metrics)
+
+                        params = {"stream_id": t.get("stream_id", "")}
+                        if "frame_index" in t:
+                            params["frame_index"] = t["frame_index"]
+                        if "audit_verdict" in t:
+                            params["audit_verdict"] = t["audit_verdict"]
+                        if "temporal_verdict" in t:
+                            params["temporal_verdict"] = t["temporal_verdict"]
+                        if "drift_flag" in t:
+                            params["drift_flag"] = t["drift_flag"]
+                        mlflow.log_params(params)
                     mlflow_buffer.remove(t)
                 except Exception as e:
                     logger.error(f"MLflow flush failed: {e}")

@@ -2,7 +2,7 @@
 
 A step-by-step guide for building ARDD-TP in order. Each phase produces a runnable, testable system before the next begins.
 
-> **Current Status:** Phase 1 ✅ complete. Phase 2 ✅ substantially complete (2026-06-14 audit: all critical bugs fixed, 53/53 unit tests passing across 4 services). Two items deferred: Step 2.4 linear interpolation (not implemented — `frames_interpolated` always 0), Step 2.6 frontend temporal-status health fetch (AuditPanel renders data but `GET /health` on connect not wired). Ready to begin Phase 3.
+> **Current Status (2026-06-24):** Phase 1 ✅ complete. Phase 2 ✅ complete. Phase 2.5 ✅ complete (EfficientNet-B4 trained, benchmark run). All Phase 2 deferred items resolved (linear interpolation ✅, health fetch ✅, VITE env vars ✅). Deprecation fixes D1/D5/D6 done. Bug fixes: MOCK_LLM config ✅, MLflow telemetry conflation ✅, PASS verdict ✅. **62/62 tests passing on host.** Ready to begin Phase 3.
 
 ---
 
@@ -270,11 +270,11 @@ curl -f http://localhost:8004/health
 # Expected: {"status": "ok", "service": "temporal-service", ...}
 ```
 
-### Step 2.4 — Implement Buffer Resilience ⚠️ PARTIALLY COMPLETE
+### Step 2.4 — Implement Buffer Resilience ✅ COMPLETED
 - [x] Pad incomplete buffer to 20 frames with zero tensors when `N < 20`; set `low_confidence_flag: true`
 - [x] Return `temporal_verdict: "UNKNOWN"` immediately without inference when `N < 6` (< 20% of window — insufficient data)
-- [ ] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing tensors from adjacent neighbours (**DEFERRED** — `frames_interpolated` always returns 0)
-- [x] Include `frames_interpolated` count in `TemporalAuditResult` (field present but always 0 until interpolation implemented)
+- [x] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing tensors from adjacent neighbours (`frames_interpolated` now correctly reports count — implemented 2026-06-24, D5 fix)
+- [x] Include `frames_interpolated` count in `TemporalAuditResult`
 
 **Verification:**
 ```bash
@@ -303,9 +303,9 @@ curl http://localhost:8003/health
 # Expected: includes temporal_service_status field
 ```
 
-### Step 2.6 — React Dashboard: Wire temporal_service_status ⚠️ PARTIALLY COMPLETE
+### Step 2.6 — React Dashboard: Wire temporal_service_status ✅ COMPLETED
 - [x] AuditPanel renders temporal audit data and "Temporal Audit Unavailable" fallback text
-- [ ] Fetch `GET /health` on connect; pass `temporal_service_status` into AuditPanel to drive the unavailable state (**DEFERRED** — health fetch on WebSocket connect not implemented)
+- [x] Fetch `GET /health` on WebSocket connect; `temporal_service_status` stored in Zustand (`store.ts`); AuditPanel now shows "Awaiting first batch window…" vs "Temporal Audit Unavailable" correctly (implemented 2026-06-24)
 - [x] Update dashboard copy: `"20-Frame Sequence Verdict"` replacing any "30s" references
 
 ### Step 2.7 — RAG Agent: Replace Hash Embeddings ✅ COMPLETED
@@ -330,7 +330,7 @@ print(f'Embedding dim: {len(v)}, range: [{min(v):.3f}, {max(v):.3f}]')
 - [x] WebSocket JWT: switched to `Sec-WebSocket-Protocol` subprotocol in both `aggregation-service/main.py` and `frontend/src/App.tsx`; `websocket.accept(subprotocol=token)` on server, `new WebSocket(url, [token])` on client
 - [x] JWT secret default raised from 16-byte `"super-secret-key"` to 32-byte `"ardd-tp-dev-secret-key-change-me!"` (eliminates `InsecureKeyLengthWarning`)
 - [x] Kafka SASL_PLAINTEXT: broker configured in docker-compose with `KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG`; all three clients (ingest-gateway, aggregation-service, temporal-service) updated with `_kafka_sasl_kwargs()` helper reading `KAFKA_SECURITY_PROTOCOL`/`KAFKA_SASL_USERNAME`/`KAFKA_SASL_PASSWORD` env vars
-- [ ] Frontend: hardcoded `CLIENT_ID = 'test_client'` / `CLIENT_SECRET = 'test_secret'` → `import.meta.env.VITE_CLIENT_ID` / `VITE_CLIENT_SECRET` (**DEFERRED**)
+- [x] Frontend: `CLIENT_ID` / `CLIENT_SECRET` use `import.meta.env.VITE_CLIENT_ID` / `VITE_CLIENT_SECRET` with `?? 'test_client'` fallback (already done in `App.tsx`)
 
 > **Note:** Kafka TLS (SASL_SSL upgrade) is deferred to Phase 5 alongside full mTLS hardening.
 
@@ -356,10 +356,10 @@ docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list \
 - [x] Update `FLOW.md` sequence diagram to show Temporal Service consuming from `frames` topic and posting to Aggregation
 - [x] Update `ROADMAP.md` Phase 2 status table entries
 - [x] Update `ARCHITECTURE.md`: Temporal Service description (ResNext50+LSTM, 20-frame tumbling window, subscribes to `frames` topic)
-- [x] `ERROR_HANDLING.md` §3b updated: linear interpolation noted as NOT implemented; `frames_interpolated` always 0; alert counter/drift history eviction (`_evict_oldest`, cap=1000) applied
+- [x] `ERROR_HANDLING.md` §3b updated: linear interpolation implemented (2026-06-24); eviction fix noted
 
-### Step 2.10 — Tests ✅ COMPLETED (19/19 passing)
-- [x] `temporal-service/tests/test_temporal.py` created with 19 tests:
+### Step 2.10 — Tests ✅ COMPLETED (20/20 passing)
+- [x] `temporal-service/tests/test_temporal.py` with 20 tests:
   - Buffer fill (20 frames) triggers flush and clears buffer (tumbling window)
   - Correct input tensor shape `[1, 20, 3, 112, 112]`
   - Zero-padding logic: `N < 20` → `low_confidence_flag: true`
@@ -373,22 +373,22 @@ docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list \
   - `deque(maxlen=20)` enforced; buffer cleared after flush
   - `model_used` field present in result
   - `window_start_frame`/`window_end_frame`/`window_duration_s` correctness verified
-- [ ] Linear interpolation test: `frames_interpolated > 0` (**DEFERRED** — feature not yet implemented)
+  - `frames_interpolated == 0` for contiguous frames (renamed from `test_frames_interpolated_always_zero`)
+- [x] Linear interpolation test: non-contiguous indices 0–4 + 8–12 → `frames_interpolated == 3` (added 2026-06-24)
 
 **Verification:**
 ```bash
-docker build -t ardd-temporal ./temporal-service
-docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal pytest tests/ -v
-# Expected: 19 tests pass (linear interpolation test deferred)
+cd temporal-service && PYTHONPATH=. .venv/bin/pytest tests/ -v
+# Expected: 20/20 pass
 ```
 
 **Phase 2 exit criteria:**
 - [x] Speed Layer (200ms SLA) and Batch Layer (20-frame tumbling, ~0.67s cycle) implemented simultaneously without interference
 - [x] Temporal Service crash does not affect Speed Layer or live dashboard scores
-- [x] Buffer resilience: padding and sparse cases handled and tested; **linear interpolation deferred**
-- [x] React Dashboard renders both Live Ticker and Audit Panel; health-status wiring deferred
+- [x] Buffer resilience: padding, sparse, and frame-gap interpolation handled and tested
+- [x] React Dashboard renders both Live Ticker and Audit Panel; health-status wiring complete
 - [x] Kafka SASL_PLAINTEXT enforced on all broker connections (ingest-gateway, aggregation-service, temporal-service)
-- [x] 19/19 Temporal Service tests pass; 53/53 total unit tests across 4 services pass
+- [x] 20/20 Temporal Service tests pass; 62/62 total unit tests across 5 services pass on host
 
 ---
 
@@ -396,7 +396,7 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 
 **Goal:** Replace the heuristic FFT frequency branch with a trained MLP, and fine-tune the full EfficientNet-B4 spatial branch on FaceForensics++ (FF++) data. After this phase the Vision Service runs a fully trained dual-branch model instead of the ImageNet-pretrained + heuristic combination.
 
-> **Status:** Training complete 2026-06-17. All five pre-training files written and tested. EfficientNet-B4 fine-tuned on FF++ c23 (10 epochs, RTX 4050 6GB, AMP FP16). Test AUC 0.9987. Step 2.5.6 benchmark run in progress (WebSocket/Kafka pipeline issue being resolved).
+> **Status:** ✅ Complete (2026-06-24). Training complete 2026-06-17. EfficientNet-B4 fine-tuned on FF++ c23 (10 epochs, RTX 4050 6GB, AMP FP16). Test AUC 0.9987. Benchmark run complete — 100% accuracy, AUC 1.0000 on 20-video FF++ test sample.
 
 **Prerequisites:** Phase 2 complete. FaceForensics++ dataset downloaded (1000 real + 2000 fake, c23 compression). `nvidia-container-toolkit` installed and configured.
 
