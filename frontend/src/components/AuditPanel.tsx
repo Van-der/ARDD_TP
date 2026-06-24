@@ -3,7 +3,7 @@ import { useStore } from '../store';
 import { Clock, Search, ShieldAlert, CheckCircle2, HelpCircle, BarChart2 } from 'lucide-react';
 
 export const AuditPanel = () => {
-  const { frames, latestTemporalAudit, connected, verdictCounts, resetVerdictCounts } = useStore();
+  const { frames, latestTemporalAudit, connected, verdictCounts, resetVerdictCounts, temporalServiceStatus } = useStore();
   const latestFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
   const renderVerdictBadge = (verdict: string) => {
@@ -50,7 +50,7 @@ export const AuditPanel = () => {
         
         {!connected ? (
           <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Offline</span>
-        ) : latestTemporalAudit ? (
+        ) : latestTemporalAudit !== null ? (
           <div className="flex-col gap-3">
             <div className="flex-row justify-between">
               <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>20-Frame Sequence Verdict</span>
@@ -76,9 +76,13 @@ export const AuditPanel = () => {
               </div>
             )}
           </div>
-        ) : (
+        ) : temporalServiceStatus === 'unavailable' ? (
           <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
             Temporal Audit Unavailable — Relying on Spatial heuristics.
+          </span>
+        ) : (
+          <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+            Awaiting first batch window (~0.67s per 20 frames)…
           </span>
         )}
       </div>

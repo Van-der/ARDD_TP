@@ -177,16 +177,35 @@ def test_window_duration_s_correct(mock_send):
     assert abs(p["window_duration_s"] - 20 / 30.0) < 0.001
 
 
-# ── frames_interpolated always 0 (zero-pads are not interpolation) ────────────
+# ── frames_interpolated is 0 for contiguous frames ───────────────────────────
 
 @patch("main.send_audit_result", new_callable=AsyncMock)
-def test_frames_interpolated_always_zero(mock_send):
+def test_frames_interpolated_zero_for_contiguous(mock_send):
     for n in (8, 15, 20):
         sid = f"interp_stream_{n}"
         fill_buffer(sid, n=n)
         client.post("/flush", json={"stream_id": sid}, headers=HEADERS)
         p = mock_send.call_args[0][0]
         assert p["frames_interpolated"] == 0
+
+
+# ── frames_interpolated > 0 when frame_index values have gaps ────────────────
+
+@patch("main.send_audit_result", new_callable=AsyncMock)
+def test_interpolation_fills_frame_gaps(mock_send):
+    """Non-contiguous frame_index values → gap frames are linearly interpolated."""
+    sid = "gap_stream"
+    stream_buffers[sid].clear()
+    jpeg_b64 = make_jpeg_b64()
+    # 10 frames: indices 0-4 then 8-12 — gap of 3 (frames 5, 6, 7 missing)
+    for i in list(range(5)) + list(range(8, 13)):
+        stream_buffers[sid].append((i, process_frame(jpeg_b64)))
+    client.post("/flush", json={"stream_id": sid}, headers=HEADERS)
+    mock_send.assert_called_once()
+    p = mock_send.call_args[0][0]
+    assert p["frames_interpolated"] == 3          # frames 5, 6, 7 synthesised
+    assert p["temporal_verdict"] in ("PASS", "FAIL")  # inference ran (n_frames=10 ≥ 6)
+    assert p["low_confidence_flag"] is True       # only 10 real frames < 20
 
 
 # ── model_used field ──────────────────────────────────────────────────────────

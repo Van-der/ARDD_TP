@@ -45,6 +45,10 @@ interface AppState {
   latestTemporalAudit: TemporalAudit | null;
   setTemporalAudit: (audit: TemporalAudit) => void;
 
+  // Temporal service health — fetched from GET /health on WebSocket connect
+  temporalServiceStatus: 'unknown' | 'ok' | 'unavailable';
+  setTemporalServiceStatus: (status: 'unknown' | 'ok' | 'unavailable') => void;
+
   // Verdict counters
   verdictCounts: VerdictCounts;
   resetVerdictCounts: () => void;
@@ -87,6 +91,9 @@ export const useStore = create<AppState>((set) => ({
       [audit.temporal_verdict]: (state.verdictCounts[audit.temporal_verdict as keyof VerdictCounts] ?? 0) + 1,
     },
   })),
+
+  temporalServiceStatus: 'unknown',
+  setTemporalServiceStatus: (temporalServiceStatus) => set({ temporalServiceStatus }),
 
   verdictCounts: { PASS: 0, FAIL: 0, UNKNOWN: 0 },
   resetVerdictCounts: () => set({ verdictCounts: { PASS: 0, FAIL: 0, UNKNOWN: 0 } }),

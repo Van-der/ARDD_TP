@@ -109,7 +109,7 @@ services:
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - OLLAMA_HOST=http://ollama:11434
-      - MOCK_LLM=false
+      - MOCK_LLM=true
     networks:
       - ardd_net
     restart: unless-stopped

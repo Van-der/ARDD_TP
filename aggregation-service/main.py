@@ -3,7 +3,8 @@ import time
 import json
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from contextlib import asynccontextmanager
+from typing import Dict, Optional
 from collections import defaultdict, deque
 
 import httpx
@@ -52,8 +53,7 @@ except Exception as e:
 
 # State
 alert_counters: Dict[str, int] = defaultdict(int)
-mlflow_buffer: List[dict] = []
-MAX_BUFFER = 100
+mlflow_buffer: deque = deque(maxlen=100)
 MAX_STREAMS = 1000  # cap on unique stream_id keys to prevent unbounded memory growth
 
 # Rolling deque per stream (maxlen=100 enforces the sliding window automatically)
@@ -122,7 +122,14 @@ class TemporalAuditResult(BaseModel):
     latency_ms: int
     timestamp_ms: int
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(mlflow_flush_task())
+    asyncio.create_task(start_labels_consumer())
+    asyncio.create_task(start_frames_consumer())
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -225,12 +232,6 @@ async def mlflow_flush_task():
                     logger.error(f"MLflow flush failed: {e}")
                     break
         await asyncio.sleep(10)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(mlflow_flush_task())
-    asyncio.create_task(start_labels_consumer())
-    asyncio.create_task(start_frames_consumer())
 
 async def verify_api_key(request: Request):
     api_key = request.headers.get("X-API-Key")
@@ -363,9 +364,7 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     }
     
     mlflow_buffer.append(telemetry)
-    if len(mlflow_buffer) > MAX_BUFFER:
-        mlflow_buffer.pop(0)
-        
+
     # Check if we already have a label for this frame
     key = f"{payload.stream_id}_{payload.frame_index}"
     result_data = {
@@ -441,9 +440,7 @@ async def temporal_audit(payload: TemporalAuditResult):
         "latency_ms": payload.latency_ms
     }
     mlflow_buffer.append(telemetry)
-    if len(mlflow_buffer) > MAX_BUFFER:
-        mlflow_buffer.pop(0)
-    
+
     return {"status": "ok"}
 
 @app.post("/aggregate", response_model=AggregatedResult, dependencies=[Depends(verify_api_key)])

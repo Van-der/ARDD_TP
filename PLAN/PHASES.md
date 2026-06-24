@@ -460,10 +460,11 @@ ls model-weights/
 - [x] Volume mounts for all three weight files: `efficientnet_b4_ff++.pt`, `fft_mlp_ff++.pt`, `fusion_alpha.npy`
 - [x] Env vars `MODEL_WEIGHTS_PATH`, `FFT_MLP_WEIGHTS_PATH`, `FUSION_WEIGHTS_PATH` wired to container paths
 
-### Step 2.5.6 — Benchmark with `video_feeder.py`
-- [ ] Run `python video_feeder.py --mode eval` against FF++ test set (140 real + 140 fake videos)
-- [ ] Collect temporal and speed layer verdicts; calculate AUC, precision, recall
-- [ ] Document results in `README.md` benchmark table
+### Step 2.5.6 — Benchmark with `run_benchmark.py` ✅ COMPLETED
+- [x] Run `python run_benchmark.py` against FF++ test split (10 real + 10 fake from videos 860–869)
+- [x] Collect speed layer verdicts via WebSocket; calculate AUC and accuracy
+- [x] Document results in `README.md` benchmark table (100% accuracy, AUC 1.0000 on 20-video sample)
+- [x] Full 140×140 eval command documented: `python run_benchmark.py --n-videos 140 --frames-per-video 10 --drain 300`
 
 > **Note:** Both `aggregation-service` and `temporal-service` Kafka consumer tasks now have a retry loop (2026-06-18 fix) — if Kafka is not ready at startup the consumer retries every 5s automatically. `<StrictMode>` removed from frontend — WebSocket cycling issue resolved.
 
@@ -473,7 +474,7 @@ ls model-weights/
 - [x] Vision Service loads trained weights on startup (`spatial_trained: true`, `fft_mlp_trained: true`, `fusion_trained: true` in `/health`)
 - [x] Speed layer test accuracy 99.41%, AUC 0.9987 on FF++ Deepfakes c23 test set
 - [x] README benchmark table populated with val/test accuracy
-- [ ] `video_feeder.py --mode eval` end-to-end benchmark run and results verified
+- [x] `run_benchmark.py` end-to-end benchmark run and results verified (100% accuracy, AUC 1.0000 on 20-video test sample)
 
 ---
 

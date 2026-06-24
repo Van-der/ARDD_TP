@@ -358,6 +358,20 @@ Trained on FaceForensics++ c23 compression, Deepfakes manipulation subset. Offic
 
 **Dataset:** [FaceForensics++](https://github.com/ondyari/FaceForensics) — Rössler et al., ICCV 2019. See [`PLAN/REFERENCES.md`](./PLAN/REFERENCES.md) for full citations.
 
+### End-to-End Pipeline Benchmark (Phase 2.5.6)
+
+Live pipeline benchmark — frames sent through Kafka → Vision Service → Aggregation Service → WebSocket, scored in real time. Tested against the first 10 videos from each class of the FF++ test split (videos 860–869).
+
+| Class | Videos | Avg deepfake_score | Classified correctly |
+|---|---|---|---|
+| Real | 10 | 0.013 (range 0.005–0.025) | **10 / 10** |
+| Fake | 10 | 0.997 (range 0.991–0.999) | **10 / 10** |
+| **Total** | **20** | — | **100% accuracy, AUC 1.0000** |
+
+**Run:** `python run_benchmark.py --n-videos 10 --frames-per-video 5 --drain 60`
+
+> Full 140 × 140 test-split eval: `python run_benchmark.py --n-videos 140 --frames-per-video 10 --drain 300`
+
 ---
 
 ## Future Scope
