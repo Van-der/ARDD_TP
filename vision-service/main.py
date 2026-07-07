@@ -96,6 +96,15 @@ def heuristic_fft_score(img_gray: np.ndarray) -> float:
     return float(torch.sigmoid(torch.tensor((mean_freq - 200.0) / 10.0)).item())
 
 
+def extract_frequency_score(img_gray: np.ndarray) -> float:
+    """Return frequency-domain fake probability for a grayscale face crop."""
+    if fft_mlp_trained:
+        fft_feat = torch.from_numpy(compute_fft_features(img_gray)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            return fft_mlp(fft_feat).item()
+    return heuristic_fft_score(img_gray)
+
+
 # ── Request / response models ─────────────────────────────────────────────────
 
 class FramePayload(BaseModel):
@@ -163,12 +172,7 @@ async def infer(payload: FramePayload):
 
             # FFT branch — computed on face crop, not full frame
             face_gray = cv2.cvtColor(face_380, cv2.COLOR_RGB2GRAY)
-            if fft_mlp_trained:
-                fft_feat = torch.from_numpy(compute_fft_features(face_gray)).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    freq_score = fft_mlp(fft_feat).item()
-            else:
-                freq_score = heuristic_fft_score(face_gray)
+            freq_score = extract_frequency_score(face_gray)
 
             deepfake_score = fuse(spatial_score, freq_score)
 

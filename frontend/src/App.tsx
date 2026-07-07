@@ -23,6 +23,7 @@ export default function App() {
     connected, setConnected,
     connectionError, setConnectionError,
     addFrame, setTemporalAudit,
+    setTemporalServiceStatus,
     activeAlert, dismissAlert
   } = useStore();
 
@@ -72,11 +73,23 @@ export default function App() {
 
       const ws = new WebSocket(WS_URL, [token]);
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
         setConnected(true);
         setConnectionError(false);
         reconnectAttemptsRef.current = 0;
         maxRetriesExhausted.current = false;
+        // Fetch temporal service health from aggregation-service on connect
+        try {
+          const resp = await fetch(`${API_URL}/health`);
+          if (resp.ok) {
+            const data = await resp.json();
+            setTemporalServiceStatus(data.temporal_service_status === 'ok' ? 'ok' : 'unavailable');
+          } else {
+            setTemporalServiceStatus('unavailable');
+          }
+        } catch {
+          setTemporalServiceStatus('unavailable');
+        }
       };
 
       ws.onmessage = (event) => {

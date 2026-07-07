@@ -6,7 +6,7 @@ Three modes:
   demo   Alternates between one real and one fake video every --switch-every
          seconds. Watch the dashboard live as the Temporal Audit flips.
   eval   Streams all real videos then all fake videos sequentially,
-         printing ground-truth labels so you can compare against scores.
+         collecting pipeline scores via WebSocket and computing AUC/accuracy.
   mix    Interleaves 20-frame blocks of real and fake on a SINGLE stream_id
          ("ff_mix"). Each block exactly fills one temporal window, so the
          Temporal Audit flips cleanly between Authentic/Fake every ~2s at 10 FPS.
@@ -18,8 +18,14 @@ Usage:
   # Mix mode — best for testing dashboard with both verdicts on one stream:
   python video_feeder.py --mode mix --fps 10
 
-  # Full evaluation run:
-  python video_feeder.py --mode eval --fps 10
+  # Pipeline smoke test (2 videos, 30 frames each — ~3 min total):
+  python video_feeder.py --mode eval --max-videos 2 --max-frames 30 --fps 3
+
+  # Full evaluation run (140 per class = FF++ test split):
+  # NOTE: Pipeline throughput is ~1.5 FPS. Always reset the Kafka consumer
+  # offset before a large eval run to avoid processing old backlogs.
+  # See BUGS_AND_ISSUES.md §INCOMPLETE-1 for the reset procedure.
+  python video_feeder.py --mode eval --max-videos 140 --fps 1
 """
 
 import os
@@ -28,6 +34,8 @@ import time
 import json
 import base64
 import argparse
+import threading
+import collections
 import cv2
 import numpy as np
 from pathlib import Path
@@ -37,8 +45,10 @@ DATASET_ROOT = Path(__file__).parent / "datasets" / "ff++"
 REAL_DIR = DATASET_ROOT / "original_sequences" / "youtube" / "c23" / "videos"
 FAKE_DIR = DATASET_ROOT / "manipulated_sequences" / "Deepfakes" / "c23" / "videos"
 
-KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
 KAFKA_TOPIC = "frames"
+API_BASE = os.getenv("EVAL_API_URL", "http://localhost:8003")
+WS_URL = os.getenv("EVAL_WS_URL", "ws://localhost:8003/stream")
 
 
 def make_producer() -> KafkaProducer:
@@ -54,10 +64,11 @@ def make_producer() -> KafkaProducer:
 
 def send_video(producer: KafkaProducer, video_path: Path, stream_id: str,
                fps: int, max_seconds: float | None = None,
-               label: str = "UNKNOWN") -> int:
+               max_frames: int = 0, label: str = "UNKNOWN") -> int:
     """
     Read frames from video_path and publish to Kafka.
     Returns total frames sent.
+    max_frames: cap per-video frame count (0 = no cap).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -72,6 +83,8 @@ def send_video(producer: KafkaProducer, video_path: Path, stream_id: str,
     try:
         while True:
             if deadline and time.time() >= deadline:
+                break
+            if max_frames > 0 and frame_index >= max_frames:
                 break
 
             ret, frame = cap.read()
@@ -221,27 +234,163 @@ def run_mix(fps: int) -> None:
         producer.close()
 
 
-def run_eval(fps: int) -> None:
-    real_videos = sorted(REAL_DIR.glob("*.mp4"))
-    fake_videos = sorted(FAKE_DIR.glob("*.mp4"))
+def _get_jwt_token() -> str | None:
+    """Fetch a JWT token from the aggregation-service auth endpoint."""
+    try:
+        import urllib.request
+        body = json.dumps({"client_id": "eval_runner", "client_secret": "eval_runner"}).encode()
+        req = urllib.request.Request(
+            f"{API_BASE}/auth/token",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())["access_token"]
+    except Exception as e:
+        print(f"  [WARN] Could not get JWT token: {e}")
+        return None
+
+
+class _WsCollector(threading.Thread):
+    """Background WebSocket listener that collects per-stream final_scores."""
+
+    def __init__(self, token: str):
+        super().__init__(daemon=True)
+        self.token = token
+        # stream_id -> list of final_score floats
+        self.scores: dict[str, list[float]] = collections.defaultdict(list)
+        self._stop = threading.Event()
+        self.error: str | None = None
+
+    def run(self) -> None:
+        import socket
+        try:
+            import websocket as ws_lib
+            # Use subprotocols= (not header=) so websocket-client handles the
+            # Sec-WebSocket-Protocol handshake correctly with Starlette's accept().
+            ws = ws_lib.create_connection(
+                WS_URL,
+                subprotocols=[self.token],
+                timeout=10,
+            )
+            ws.settimeout(1.0)
+            while not self._stop.is_set():
+                try:
+                    raw = ws.recv()
+                    data = json.loads(raw)
+                    if data.get("type") == "temporal_audit":
+                        continue
+                    sid = data.get("stream_id", "")
+                    # aggregation-service broadcasts final_score under key "deepfake_score"
+                    score = data.get("deepfake_score")
+                    if sid and score is not None:
+                        self.scores[sid].append(float(score))
+                except socket.timeout:
+                    continue  # expected when no message arrives within 1s
+                except Exception as e:
+                    err = str(e).lower()
+                    if "timed out" in err or "timeout" in err:
+                        continue
+                    # Real connection error — stop collecting
+                    self.error = str(e)
+                    break
+            ws.close()
+        except Exception as e:
+            self.error = str(e)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _print_metrics(scores: dict[str, list[float]], real_prefix: str, fake_prefix: str) -> None:
+    """Compute and print binary classification metrics from collected scores."""
+    y_true, y_score, y_pred = [], [], []
+    for sid, vals in scores.items():
+        if not vals:
+            continue
+        avg = sum(vals) / len(vals)
+        if sid.startswith(real_prefix):
+            y_true.append(0)
+        elif sid.startswith(fake_prefix):
+            y_true.append(1)
+        else:
+            continue
+        y_score.append(avg)
+        y_pred.append(1 if avg >= 0.5 else 0)
+
+    n = len(y_true)
+    if n == 0:
+        print("  No scored streams collected — metrics unavailable.")
+        return
+
+    correct = sum(t == p for t, p in zip(y_true, y_pred))
+    tp = sum(t == 1 and p == 1 for t, p in zip(y_true, y_pred))
+    fp = sum(t == 0 and p == 1 for t, p in zip(y_true, y_pred))
+    fn = sum(t == 1 and p == 0 for t, p in zip(y_true, y_pred))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    accuracy = correct / n
+
+    try:
+        from sklearn.metrics import roc_auc_score
+        auc = roc_auc_score(y_true, y_score)
+        auc_str = f"{auc:.4f}"
+    except Exception:
+        auc_str = "N/A (sklearn not available)"
+
+    print(f"\n{'='*50}")
+    print(f"  End-to-End Pipeline Benchmark Results")
+    print(f"{'='*50}")
+    print(f"  Streams scored : {n}  ({sum(1 for t in y_true if t==0)} real, {sum(1 for t in y_true if t==1)} fake)")
+    print(f"  Accuracy       : {accuracy:.4f}  ({correct}/{n})")
+    print(f"  Precision      : {precision:.4f}")
+    print(f"  Recall         : {recall:.4f}")
+    print(f"  AUC            : {auc_str}")
+    print(f"{'='*50}\n")
+
+
+def run_eval(fps: int, max_videos: int, max_frames: int = 0) -> None:
+    all_real = sorted(REAL_DIR.glob("*.mp4"))
+    all_fake = sorted(FAKE_DIR.glob("*.mp4"))
+
+    # Honour --max-videos (0 = no limit)
+    real_videos = all_real[:max_videos] if max_videos > 0 else all_real
+    fake_videos = all_fake[:max_videos] if max_videos > 0 else all_fake
+
+    print(f"Eval mode — {len(real_videos)} real + {len(fake_videos)} fake videos at {fps} FPS")
+    if max_videos > 0:
+        print(f"  (limited to {max_videos} per class via --max-videos)")
+
+    # Start WebSocket metric collector
+    token = _get_jwt_token()
+    collector: _WsCollector | None = None
+    if token:
+        collector = _WsCollector(token)
+        collector.start()
+        print("  WebSocket metric collector started.")
+    else:
+        print("  WebSocket unavailable — metrics will not be collected.")
+    print()
 
     producer = make_producer()
-    print(f"Eval mode — {len(real_videos)} real + {len(fake_videos)} fake videos at {fps} FPS\n")
-
+    real_prefix = "eval_real_"
+    fake_prefix = "eval_fake_"
     total_real = total_fake = 0
     try:
         print("=== REAL VIDEOS ===")
         for i, v in enumerate(real_videos):
             print(f"[{i+1:3d}/{len(real_videos)}] REAL  {v.name}")
-            n = send_video(producer, v, stream_id=f"eval_real_{v.stem}",
-                           fps=fps, label="REAL")
+            n = send_video(producer, v, stream_id=f"{real_prefix}{v.stem}",
+                           fps=fps, max_frames=max_frames, label="REAL")
             total_real += n
 
         print("\n=== FAKE VIDEOS ===")
         for i, v in enumerate(fake_videos):
             print(f"[{i+1:3d}/{len(fake_videos)}] FAKE  {v.name}")
-            n = send_video(producer, v, stream_id=f"eval_fake_{v.stem}",
-                           fps=fps, label="FAKE")
+            n = send_video(producer, v, stream_id=f"{fake_prefix}{v.stem}",
+                           fps=fps, max_frames=max_frames, label="FAKE")
             total_fake += n
 
     except KeyboardInterrupt:
@@ -249,7 +398,21 @@ def run_eval(fps: int) -> None:
     finally:
         producer.close()
 
-    print(f"\nDone — {total_real} real frames + {total_fake} fake frames sent.")
+    print(f"\nFrames sent: {total_real} real + {total_fake} fake")
+
+    # Give pipeline time to process remaining frames from Kafka.
+    # Measured throughput: ~1.5-2 FPS (vision+RAG ~500ms/frame on CPU/GPU).
+    # Drain = total_frames / 1.5, min 20s, max 90s.
+    if collector:
+        drain_secs = max(20, min(90, int((total_real + total_fake) / 1.5)))
+        print(f"Waiting {drain_secs}s for pipeline to drain remaining frames...")
+        time.sleep(drain_secs)
+        collector.stop()
+        collector.join(timeout=3)
+        if collector.error:
+            print(f"  [WARN] WebSocket collector error: {collector.error}")
+        print(f"  Streams in collector: {list(collector.scores.keys())}")
+        _print_metrics(collector.scores, real_prefix, fake_prefix)
 
 
 def main() -> None:
@@ -259,6 +422,10 @@ def main() -> None:
                         help="Frames per second to publish (default: 10)")
     parser.add_argument("--switch-every", type=int, default=15,
                         help="Demo mode: seconds per video before switching (default: 15)")
+    parser.add_argument("--max-videos", type=int, default=0,
+                        help="Eval mode: max videos per class (0 = all, 140 = FF++ test split)")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="Eval mode: max frames per video (0 = all). Use 20-50 for quick pipeline smoke tests")
     args = parser.parse_args()
 
     if not REAL_DIR.exists() or not FAKE_DIR.exists():
@@ -273,7 +440,7 @@ def main() -> None:
     elif args.mode == "mix":
         run_mix(fps=args.fps)
     else:
-        run_eval(fps=args.fps)
+        run_eval(fps=args.fps, max_videos=args.max_videos, max_frames=args.max_frames)
 
 
 if __name__ == "__main__":

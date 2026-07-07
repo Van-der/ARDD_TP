@@ -1,3 +1,4 @@
+import os
 import time
 import json
 import base64
@@ -6,61 +7,94 @@ import cv2
 import numpy as np
 from kafka import KafkaProducer
 
-def generate_frame_b64(is_fake=False):
-    """Generate a dummy image. Red tint if fake, green if real."""
-    img = np.zeros((224, 224, 3), dtype=np.uint8)
+_MATPLOTLIB_FACE = os.path.expanduser(
+    "~/.venvs/ardd-tp/lib/python3.13/site-packages/"
+    "matplotlib/mpl-data/sample_data/grace_hopper.jpg"
+)
+
+# Score targets:
+#   real  → ~0.005  (below ALERT_THRESHOLD=0.25)
+#   fake  → ~0.25–0.35 depending on JPEG quality used
+FAKE_QUALITIES = [3, 5, 7, 10]  # lower = more artefacts = higher deepfake score
+
+
+def _load_frames():
+    img = cv2.imread(_MATPLOTLIB_FACE)
+    if img is None:
+        raise FileNotFoundError(f"Grace Hopper image not found at {_MATPLOTLIB_FACE}")
+
+    # Real: clean encode
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    real_b64 = base64.b64encode(buf).decode()
+
+    # Fakes: multiple quality levels give slight score variation
+    fakes = []
+    for q in FAKE_QUALITIES:
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
+        img2 = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+        _, buf2 = cv2.imencode(".jpg", img2)
+        fakes.append(base64.b64encode(buf2).decode())
+
+    return real_b64, fakes
+
+
+def _next_block():
+    """Return (is_fake, block_length) for the next segment."""
+    # ~65% of time in real state, 35% fake
+    is_fake = random.random() < 0.35
     if is_fake:
-        img[:, :, 2] = 200  # Red
+        length = random.randint(6, 18)   # enough to cross the 5-frame alert window
     else:
-        img[:, :, 1] = 200  # Green
-        
-    _, buf = cv2.imencode('.jpg', img)
-    return base64.b64encode(buf.tobytes()).decode('utf-8')
+        length = random.randint(8, 30)   # varying real stretches
+    return is_fake, length
+
 
 def main():
+    real_b64, fakes = _load_frames()
+    print("Grace Hopper frames ready.")
     print("Connecting to Kafka...")
+
     producer = KafkaProducer(
-        bootstrap_servers='localhost:9092',
-        security_protocol='SASL_PLAINTEXT',
-        sasl_mechanism='PLAIN',
-        sasl_plain_username='admin',
-        sasl_plain_password='admin-secret',
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092"),
+        security_protocol="SASL_PLAINTEXT",
+        sasl_mechanism="PLAIN",
+        sasl_plain_username="admin",
+        sasl_plain_password="admin-secret",
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
     )
-    
+
     stream_id = "live_demo_stream"
     frame_index = 0
-    print(f"Starting simulation for {stream_id}...")
-    print("Open your browser to http://localhost:3000 to see the dashboard.")
-    print("Press Ctrl+C to stop.")
-    
+    print(f"stream_id={stream_id}  |  ALERT_THRESHOLD=0.25  |  alert after 5 consecutive fake frames")
+    print("Pattern: randomized real/fake blocks — Ctrl+C to stop\n")
+
     try:
         while True:
-            # Create a sudden "deepfake attack" for 10 frames every 50 frames
-            # so the user can see the Alert Banner trigger
-            is_fake_attack = (frame_index % 50 >= 40)
-            
-            payload = {
-                "stream_id": stream_id,
-                "frame_index": frame_index,
-                "timestamp_ms": int(time.time() * 1000),
-                "payload": generate_frame_b64(is_fake=is_fake_attack)
-            }
-            
-            producer.send("frames", payload)
-            
-            if is_fake_attack:
-                print(f"[{frame_index}] Sent FAKE frame (Watch the dashboard alert spike!)")
-            else:
-                print(f"[{frame_index}] Sent normal frame")
-                
-            frame_index += 1
-            time.sleep(0.1)  # 10 FPS
-            
+            is_fake, block_len = _next_block()
+
+            for _ in range(block_len):
+                if is_fake:
+                    b64 = random.choice(fakes)
+                    label = "FAKE"
+                else:
+                    b64 = real_b64
+                    label = "real"
+
+                producer.send("frames", {
+                    "stream_id": stream_id,
+                    "frame_index": frame_index,
+                    "timestamp_ms": int(time.time() * 1000),
+                    "payload": b64,
+                })
+                print(f"[{frame_index:05d}] {label}")
+                frame_index += 1
+                time.sleep(0.15)
+
     except KeyboardInterrupt:
-        print("\nStopping simulation.")
+        print("\nStopped.")
     finally:
         producer.close()
+
 
 if __name__ == "__main__":
     main()

@@ -2,7 +2,7 @@
 
 A step-by-step guide for building ARDD-TP in order. Each phase produces a runnable, testable system before the next begins.
 
-> **Current Status:** Phase 1 ✅ complete. Phase 2 ✅ substantially complete (2026-06-14 audit: all critical bugs fixed, 53/53 unit tests passing across 4 services). Two items deferred: Step 2.4 linear interpolation (not implemented — `frames_interpolated` always 0), Step 2.6 frontend temporal-status health fetch (AuditPanel renders data but `GET /health` on connect not wired). Ready to begin Phase 3.
+> **Current Status (2026-07-04):** Phase 1 ✅ complete. Phase 2 ✅ complete — all items including Step 2.4 linear interpolation, Step 2.6 health fetch on connect, and Step 2.8 frontend env vars are implemented and tested. Phase 2.5 ✅ complete — Speed Layer trained, pipeline verified (smoke test AUC=1.0000). Full 140/140 benchmark pending Phase 3 gRPC throughput upgrade. Security hardening applied to aggregation-service (2026-07-04). 80/80 unit tests passing. Ready to begin Phase 3.
 
 ---
 
@@ -270,11 +270,11 @@ curl -f http://localhost:8004/health
 # Expected: {"status": "ok", "service": "temporal-service", ...}
 ```
 
-### Step 2.4 — Implement Buffer Resilience ⚠️ PARTIALLY COMPLETE
+### Step 2.4 — Implement Buffer Resilience ✅ COMPLETED
 - [x] Pad incomplete buffer to 20 frames with zero tensors when `N < 20`; set `low_confidence_flag: true`
 - [x] Return `temporal_verdict: "UNKNOWN"` immediately without inference when `N < 6` (< 20% of window — insufficient data)
-- [ ] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing tensors from adjacent neighbours (**DEFERRED** — `frames_interpolated` always returns 0)
-- [x] Include `frames_interpolated` count in `TemporalAuditResult` (field present but always 0 until interpolation implemented)
+- [x] Detect frame gaps via non-contiguous `frame_index`; linearly interpolate missing tensors from adjacent neighbours (`frames_interpolated` correctly reported — verified by `test_interpolation_fills_frame_gaps`)
+- [x] Include `frames_interpolated` count in `TemporalAuditResult`
 
 **Verification:**
 ```bash
@@ -303,9 +303,9 @@ curl http://localhost:8003/health
 # Expected: includes temporal_service_status field
 ```
 
-### Step 2.6 — React Dashboard: Wire temporal_service_status ⚠️ PARTIALLY COMPLETE
+### Step 2.6 — React Dashboard: Wire temporal_service_status ✅ COMPLETED
 - [x] AuditPanel renders temporal audit data and "Temporal Audit Unavailable" fallback text
-- [ ] Fetch `GET /health` on connect; pass `temporal_service_status` into AuditPanel to drive the unavailable state (**DEFERRED** — health fetch on WebSocket connect not implemented)
+- [x] Fetch `GET /health` on WebSocket open; `setTemporalServiceStatus(data.temporal_service_status === 'ok' ? 'ok' : 'unavailable')` — wired in `App.tsx` lines 81–92
 - [x] Update dashboard copy: `"20-Frame Sequence Verdict"` replacing any "30s" references
 
 ### Step 2.7 — RAG Agent: Replace Hash Embeddings ✅ COMPLETED
@@ -329,8 +329,9 @@ print(f'Embedding dim: {len(v)}, range: [{min(v):.3f}, {max(v):.3f}]')
 - [x] `vision-service/main.py` — `weights_only=True` added to `torch.load` call
 - [x] WebSocket JWT: switched to `Sec-WebSocket-Protocol` subprotocol in both `aggregation-service/main.py` and `frontend/src/App.tsx`; `websocket.accept(subprotocol=token)` on server, `new WebSocket(url, [token])` on client
 - [x] JWT secret default raised from 16-byte `"super-secret-key"` to 32-byte `"ardd-tp-dev-secret-key-change-me!"` (eliminates `InsecureKeyLengthWarning`)
-- [x] Kafka SASL_PLAINTEXT: broker configured in docker-compose with `KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG`; all three clients (ingest-gateway, aggregation-service, temporal-service) updated with `_kafka_sasl_kwargs()` helper reading `KAFKA_SECURITY_PROTOCOL`/`KAFKA_SASL_USERNAME`/`KAFKA_SASL_PASSWORD` env vars
-- [ ] Frontend: hardcoded `CLIENT_ID = 'test_client'` / `CLIENT_SECRET = 'test_secret'` → `import.meta.env.VITE_CLIENT_ID` / `VITE_CLIENT_SECRET` (**DEFERRED**)
+- [x] Kafka SASL_PLAINTEXT: broker configured in docker-compose; all three clients (ingest-gateway, aggregation-service, temporal-service) use `_kafka_sasl_kwargs()` reading from `KAFKA_SASL_USERNAME`/`KAFKA_SASL_PASSWORD` env vars (hardcoded values removed 2026-07-04)
+- [x] Frontend: `CLIENT_ID` / `CLIENT_SECRET` read from `import.meta.env.VITE_CLIENT_ID` / `VITE_CLIENT_SECRET` with safe fallback defaults (implemented in prior commits)
+- [x] **Security hardening (2026-07-04):** Rate limiting on `POST /auth/token` (20 req/60s per IP), stream_id format validation (rejects injection patterns), payload size guard (2MB base64), SSRF guard on webhook delivery, startup warnings for default credentials
 
 > **Note:** Kafka TLS (SASL_SSL upgrade) is deferred to Phase 5 alongside full mTLS hardening.
 
@@ -358,22 +359,9 @@ docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list \
 - [x] Update `ARCHITECTURE.md`: Temporal Service description (ResNext50+LSTM, 20-frame tumbling window, subscribes to `frames` topic)
 - [x] `ERROR_HANDLING.md` §3b updated: linear interpolation noted as NOT implemented; `frames_interpolated` always 0; alert counter/drift history eviction (`_evict_oldest`, cap=1000) applied
 
-### Step 2.10 — Tests ✅ COMPLETED (19/19 passing)
-- [x] `temporal-service/tests/test_temporal.py` created with 19 tests:
-  - Buffer fill (20 frames) triggers flush and clears buffer (tumbling window)
-  - Correct input tensor shape `[1, 20, 3, 112, 112]`
-  - Zero-padding logic: `N < 20` → `low_confidence_flag: true`
-  - Sparse buffer: `N < 6` → `temporal_verdict: "UNKNOWN"` without inference
-  - ResNext50+LSTM inference produces valid `temporal_score` in `[0.0, 1.0]`
-  - `TemporalAuditResult` schema validation (all 11 fields present and typed)
-  - Auth 401 on missing/bad `X-API-Key` for `/health`, `/batch_status`, `/flush`
-  - `GET /health` returns `{status, buffer_sizes, uptime_s}`
-  - `GET /batch_status` reflects live buffer state
-  - `POST /flush` on unknown stream_id → noop; on empty stream → UNKNOWN sent; on full stream → inference runs
-  - `deque(maxlen=20)` enforced; buffer cleared after flush
-  - `model_used` field present in result
-  - `window_start_frame`/`window_end_frame`/`window_duration_s` correctness verified
-- [ ] Linear interpolation test: `frames_interpolated > 0` (**DEFERRED** — feature not yet implemented)
+### Step 2.10 — Tests ✅ COMPLETED (20/20 passing)
+- [x] `temporal-service/tests/test_temporal.py` — 20 tests covering: buffer fill, tensor shape, zero-padding, sparse fallback, full inference, schema validation, auth, batch_status, flush edge cases, deque maxlen, model_used field, window frame indices, duration, contiguous interpolation=0, **non-contiguous interpolation > 0**
+- [x] `aggregation-service/tests/test_aggregation.py` — 30 tests (was 20): adds `temporal_audit` endpoint, MLflow buffer populated + frame_index step, stream_id validation (injection/length), payload size guard, auth rate limiting, SASL kwargs env vars
 
 **Verification:**
 ```bash
@@ -385,10 +373,10 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 **Phase 2 exit criteria:**
 - [x] Speed Layer (200ms SLA) and Batch Layer (20-frame tumbling, ~0.67s cycle) implemented simultaneously without interference
 - [x] Temporal Service crash does not affect Speed Layer or live dashboard scores
-- [x] Buffer resilience: padding and sparse cases handled and tested; **linear interpolation deferred**
-- [x] React Dashboard renders both Live Ticker and Audit Panel; health-status wiring deferred
-- [x] Kafka SASL_PLAINTEXT enforced on all broker connections (ingest-gateway, aggregation-service, temporal-service)
-- [x] 19/19 Temporal Service tests pass; 53/53 total unit tests across 4 services pass
+- [x] Buffer resilience: padding, sparse cases, and linear interpolation for frame gaps — all handled and tested
+- [x] React Dashboard renders both Live Ticker and Audit Panel; temporal_service_status wired via GET /health on WebSocket connect
+- [x] Kafka SASL_PLAINTEXT enforced on all broker connections; SASL credentials read from env vars (not hardcoded)
+- [x] 80/80 unit tests pass across 5 services (host, Python 3.13.13)
 
 ---
 

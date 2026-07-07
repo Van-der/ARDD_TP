@@ -68,3 +68,6 @@ datasets/
 
 # Training artifacts (face_crops/ is large and not committed)
 face_crops/
+
+BUGS_AND_ISSUES.md
+CLAUDE.md

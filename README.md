@@ -312,14 +312,16 @@ ARDD_TP/
 
 ## Test Coverage
 
-| Service | Tests | Status |
+| Service | Tests | Coverage |
 |---|---|---|
-| Ingest Gateway | 6 | Kafka publish, FPS downsampling, SASL config |
+| Ingest Gateway | 4 | Kafka publish, FPS downsampling, SASL config, auth |
 | Vision Service | 16 | Spatial branch, frequency branch, score formula, alignment failure, payload limits, auth |
-| RAG Agent | 6 | FAISS search, verdict generation, similarity threshold, auth |
-| Aggregation Service | 22 | Full pipeline, Vision 502, RAG timeout fallback, WebSocket JWT, alert window, drift detection |
-| Temporal Service | 19 | Buffer fill, tensor shape, zero-padding, sparse fallback, full inference, schema validation, auth |
-| **Total** | **69** | **53 pass on host** · vision-service requires Docker (Python 3.14 / facenet-pytorch incompatibility) |
+| RAG Agent | 10 | FAISS search, verdict generation, similarity threshold, payload validation, auth |
+| Aggregation Service | 30 | Full pipeline, Vision 502, RAG timeout, WebSocket JWT, alert window, drift, temporal audit, MLflow buffer, stream_id validation, payload size guard, rate limiting, SASL env vars |
+| Temporal Service | 20 | Buffer fill, tensor shape, zero-padding, sparse fallback, full inference, interpolation, schema validation, auth |
+| **Total** | **80** | **All 80 pass on host (Python 3.13.13)** |
+
+> Vision-service tests run natively on the host — the Python 3.14 / facenet-pytorch incompatibility no longer applies (host is Python 3.13.13).
 
 ---
 

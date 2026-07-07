@@ -17,6 +17,7 @@ app = FastAPI()
 # Config
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "tinyllama")
 MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
 START_TIME = time.time()
 
@@ -140,11 +141,11 @@ Analyze if this is a deepfake threat. You must respond ONLY with a JSON object i
 The verdict must be FAIL, PASS, or UNKNOWN.
 """
     try:
-        async with httpx.AsyncClient(timeout=0.1) as client:  # Enforce sub-100ms LLM budget if possible
+        async with httpx.AsyncClient(timeout=12.0) as client:
             response = await client.post(
                 f"{OLLAMA_HOST}/api/generate",
                 json={
-                    "model": "mistral",
+                    "model": OLLAMA_MODEL,
                     "prompt": prompt,
                     "stream": False,
                     "format": "json"

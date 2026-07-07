@@ -4,11 +4,11 @@ uvicorn[standard]
 pydantic
 
 # Kafka
-kafka-python
+kafka-python-ng
 aiokafka
 
 # Computer vision & deep learning
-opencv-python
+opencv-python-headless
 torch
 torchvision
 facenet-pytorch
@@ -24,6 +24,16 @@ PyJWT
 
 # ML tracking
 mlflow
+
+# WebSocket
+websockets
+
+# RAG Agent
+langchain
+langchain-community
+langchain-huggingface
+faiss-cpu
+sentence-transformers
 
 # Training (Phase 2.5)
 scikit-learn

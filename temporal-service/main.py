@@ -5,6 +5,7 @@ import json
 import logging
 import asyncio
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from typing import Dict, Any
 
 import torch
@@ -36,16 +37,21 @@ def _kafka_sasl_kwargs() -> dict:
     return {
         "security_protocol": "SASL_PLAINTEXT",
         "sasl_mechanism": "PLAIN",
-        "sasl_plain_username": "admin",
-        "sasl_plain_password": "admin-secret",
+        "sasl_plain_username": KAFKA_SASL_USERNAME or "admin",
+        "sasl_plain_password": KAFKA_SASL_PASSWORD or "admin-secret",
         "api_version": "auto",
     }
 WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "/app/weights/model_87_acc_20_frames_final_data.pt")
 START_TIME = time.time()
 TARGET_FRAMES = 20
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(frames_consumer_task())
+    yield
+
 # Initialization
-app = FastAPI(title="ARDD-TP Temporal Service")
+app = FastAPI(title="ARDD-TP Temporal Service", lifespan=lifespan)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_used = "random-fallback"
 
@@ -115,10 +121,8 @@ async def run_inference_and_flush(stream_id: str):
     items = list(buffer)
     buffer.clear()
 
-    frame_indices = [fi for fi, _ in items]
-    frames = [t for _, t in items]
-    window_start = frame_indices[0] if frame_indices else 0
-    window_end = frame_indices[-1] if frame_indices else 0
+    window_start = items[0][0] if items else 0
+    window_end = items[-1][0] if items else 0
 
     if n_frames < 6:
         logger.warning(f"Flush aborted for {stream_id}, insufficient frames ({n_frames})")
@@ -140,12 +144,29 @@ async def run_inference_and_flush(stream_id: str):
 
     start_time = time.time()
 
-    if n_frames < TARGET_FRAMES:
-        pad_size = TARGET_FRAMES - n_frames
+    # Sort by frame_index and interpolate tensors across any gaps
+    items_sorted = sorted(items, key=lambda x: x[0])
+    filled: list = []
+    interpolated_count = 0
+    for i in range(len(items_sorted) - 1):
+        filled.append(items_sorted[i])
+        idx_a, t_a = items_sorted[i]
+        idx_b, t_b = items_sorted[i + 1]
+        for k in range(1, idx_b - idx_a):
+            alpha = k / (idx_b - idx_a)
+            filled.append((idx_a + k, (1 - alpha) * t_a + alpha * t_b))
+            interpolated_count += 1
+    filled.append(items_sorted[-1])
+
+    frames = [t for _, t in filled]
+    n_filled = len(frames)
+
+    if n_filled < TARGET_FRAMES:
+        pad_size = TARGET_FRAMES - n_filled
         zero_tensor = torch.zeros_like(frames[0])
         frames.extend([zero_tensor] * pad_size)
 
-    batch = torch.stack(frames).unsqueeze(0).to(device)  # shape: (1, 20, 3, 112, 112)
+    batch = torch.stack(frames[:TARGET_FRAMES]).unsqueeze(0).to(device)  # (1, 20, 3, 112, 112)
 
     with torch.no_grad():
         _, logits = model(batch)
@@ -155,7 +176,7 @@ async def run_inference_and_flush(stream_id: str):
     verdict = "FAIL" if fake_prob > 0.5 else "PASS"
     latency_ms = int((time.time() - start_time) * 1000)
 
-    logger.info(f"Inference complete: stream={stream_id} score={fake_prob:.3f}")
+    logger.info(f"Inference complete: stream={stream_id} score={fake_prob:.3f} interpolated={interpolated_count}")
 
     payload = {
         "stream_id": stream_id,
@@ -165,7 +186,7 @@ async def run_inference_and_flush(stream_id: str):
         "temporal_score": fake_prob,
         "temporal_verdict": verdict,
         "low_confidence_flag": n_frames < TARGET_FRAMES,
-        "frames_interpolated": 0,  # zero-pads are not interpolation; gap interpolation not yet implemented
+        "frames_interpolated": interpolated_count,
         "model_used": model_used,
         "latency_ms": latency_ms,
         "timestamp_ms": int(time.time() * 1000)
@@ -182,6 +203,7 @@ async def frames_consumer_task():
                 KAFKA_TOPIC,
                 bootstrap_servers=KAFKA_BOOTSTRAP,
                 group_id="temporal-service-group",
+                auto_offset_reset="latest",
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
                 **_kafka_sasl_kwargs()
             )
@@ -207,10 +229,6 @@ async def frames_consumer_task():
         except Exception as e:
             logger.error(f"Temporal frames consumer crashed: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(frames_consumer_task())
 
 @app.get("/health")
 async def health():

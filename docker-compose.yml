@@ -23,19 +23,23 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT
+      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9092,SASL_PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka:9092,SASL_PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_PLAINTEXT_HOST:SASL_PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
       KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
       KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
       KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret" user_admin="admin-secret";'
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT__HOST_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret" user_admin="admin-secret";'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_MS: 7200000
+      KAFKA_LOG_RETENTION_BYTES: 536870912
       KAFKA_OPTS: "-Ddummy=true"
     ports:
       - "9092:9092"
+      - "29092:29092"
     networks:
       - ardd_net
     restart: unless-stopped
@@ -78,6 +82,7 @@ services:
       - FFT_MLP_WEIGHTS_PATH=/app/weights/fft_mlp_ff++.pt
       - FUSION_WEIGHTS_PATH=/app/weights/fusion_alpha.npy
     volumes:
+      - torch_hub_cache:/root/.cache/torch/hub
       - ./model-weights/efficientnet_b4_ff++.pt:/app/weights/efficientnet_b4_ff++.pt:ro
       - ./model-weights/fft_mlp_ff++.pt:/app/weights/fft_mlp_ff++.pt:ro
       - ./model-weights/fusion_alpha.npy:/app/weights/fusion_alpha.npy:ro
@@ -109,7 +114,8 @@ services:
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - OLLAMA_HOST=http://ollama:11434
-      - MOCK_LLM=false
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-tinyllama}
+      - MOCK_LLM=${MOCK_LLM:-true}
     networks:
       - ardd_net
     restart: unless-stopped
@@ -145,6 +151,8 @@ services:
       - KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT
       - KAFKA_SASL_USERNAME=${KAFKA_SASL_USERNAME:-admin}
       - KAFKA_SASL_PASSWORD=${KAFKA_SASL_PASSWORD:-admin-secret}
+      - ALERT_THRESHOLD=${ALERT_THRESHOLD:-0.90}
+      - ALERT_WINDOW=${ALERT_WINDOW:-5}
     networks:
       - ardd_net
     restart: unless-stopped
@@ -176,7 +184,7 @@ services:
       - KAFKA_SASL_USERNAME=${KAFKA_SASL_USERNAME:-admin}
       - KAFKA_SASL_PASSWORD=${KAFKA_SASL_PASSWORD:-admin-secret}
     volumes:
-      - ${HOME}/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/blobs/0f1b48a51886f487e7ce9880a59ddf6c44e7da0d5b5265ed772871e1e9b1c578:/app/weights/model_87_acc_20_frames_final_data.pt:ro
+      - ${TEMPORAL_WEIGHTS_PATH:-./temporal-service/weights/model_87_acc_20_frames_final_data.pt}:/app/weights/model_87_acc_20_frames_final_data.pt:ro
     networks:
       - ardd_net
     restart: unless-stopped
@@ -184,23 +192,24 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 120s
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.11.1
     container_name: mlflow
-    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow-artifacts
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow-data/mlflow.db --default-artifact-root /mlflow-data/artifacts
     ports:
       - "5000:5000"
     environment:
       - MLFLOW_TRACKING_TOKEN=${MLFLOW_TRACKING_TOKEN}
     volumes:
-      - ./mlflow-data:/mlflow-artifacts
+      - mlflow_data:/mlflow-data
     networks:
       - ardd_net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -211,10 +220,7 @@ services:
     expose:
       - "11434"
     volumes:
-      # Mount host system Ollama model store (blobs + manifests) into the container.
-      # Host stores models at /var/lib/ollama/{blobs,manifests}; container expects
-      # them under /root/.ollama/models/{blobs,manifests}.
-      - /var/lib/ollama:/root/.ollama/models:ro
+      - ollama_models:/root/.ollama
     networks:
       - ardd_net
     restart: unless-stopped
@@ -245,3 +251,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+volumes:
+  torch_hub_cache:
+  ollama_models:
+  mlflow_data:
