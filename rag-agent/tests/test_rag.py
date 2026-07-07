@@ -72,21 +72,29 @@ def test_audit_high_score_fail():
     assert d["audit_verdict"] == "FAIL"
 
 
-# ── Unit: low score → UNKNOWN (no match above threshold) ─────────────────────
+# ── Unit: low score (< 0.3) → PASS ──────────────────────────────────────────
 
-def test_audit_low_score_unknown():
-    """Low deepfake_score → mock LLM returns UNKNOWN verdict (SCHEMA.md §9.2, ERROR_HANDLING §4).
-    
-    Note: a signature may still be matched by vector similarity, but with score < 0.5
-    the mock LLM verdict resolves to UNKNOWN. audit_verdict is the primary requirement.
-    """
+def test_audit_low_score_pass():
+    """deepfake_score < 0.3 → mock LLM returns PASS (content is confidently real)."""
     r = client.post("/audit",
                     json={"stream_id": "s", "frame_index": 0, "deepfake_score": 0.1},
                     headers=HEADERS)
     assert r.status_code == 200
     d = r.json()
+    assert d["audit_verdict"] == "PASS"
+    assert d["confidence"] > 0.0
+
+
+# ── Unit: borderline score (0.3–0.49) → UNKNOWN ──────────────────────────────
+
+def test_audit_borderline_score_unknown():
+    """deepfake_score in [0.3, 0.5) → mock LLM returns UNKNOWN (genuinely uncertain range)."""
+    r = client.post("/audit",
+                    json={"stream_id": "s", "frame_index": 0, "deepfake_score": 0.4},
+                    headers=HEADERS)
+    assert r.status_code == 200
+    d = r.json()
     assert d["audit_verdict"] == "UNKNOWN"
-    # confidence must be 0.0 when verdict is UNKNOWN from mock LLM
     assert d["confidence"] == 0.0
 
 

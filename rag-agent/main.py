@@ -123,9 +123,10 @@ def map_score_to_query(score: float) -> str:
 async def generate_verdict_via_llm(score: float, sig_label: str, sig_desc: str, sig_sev: str) -> Tuple[str, float]:
     """Generates the verdict by calling the Ollama service."""
     if MOCK_LLM:
-        # Simulate local check: High score and matching signature is a FAIL
         if score >= 0.5:
             return "FAIL", min(0.95, float(score + 0.1))
+        if score < 0.3:
+            return "PASS", round(1.0 - score, 4)
         return "UNKNOWN", 0.0
 
     import httpx
