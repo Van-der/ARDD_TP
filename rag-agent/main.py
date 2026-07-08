@@ -77,7 +77,8 @@ def init_vector_store():
                 metadata={
                     "signature_id": sig["signature_id"],
                     "label": sig["label"],
-                    "severity": sig["severity"]
+                    "severity": sig["severity"],
+                    "artefact_tags": sig["artefact_tags"],
                 }
             )
             documents.append(doc)
@@ -104,6 +105,7 @@ class AuditResult(BaseModel):
     audit_verdict: str
     matched_signature: Optional[str]
     confidence: float
+    summary: str
 
 async def verify_api_key(request: Request):
     api_key = request.headers.get("X-API-Key")
@@ -120,14 +122,28 @@ def map_score_to_query(score: float) -> str:
     else:
         return "low deepfake score clean face authentic real frame eye reflection mismatch"
 
-async def generate_verdict_via_llm(score: float, sig_label: str, sig_desc: str, sig_sev: str) -> Tuple[str, float]:
+async def generate_verdict_via_llm(
+    score: float, sig_label: str, sig_desc: str, sig_sev: str,
+    sig_tags: Optional[List[str]] = None,
+) -> Tuple[str, float, str]:
     """Generates the verdict by calling the Ollama service."""
     if MOCK_LLM:
-        if score >= 0.5:
-            return "FAIL", min(0.95, float(score + 0.1))
-        if score < 0.3:
-            return "PASS", round(1.0 - score, 4)
-        return "UNKNOWN", 0.0
+        sev = sig_sev.capitalize()
+        tags_str = ", ".join(sig_tags).replace("_", " ") if sig_tags else "unknown artifacts"
+        if score >= 0.80:
+            summary = (f"High-confidence {sig_label} detected ({sev} severity). "
+                       f"Spatial artifacts: {tags_str}.")
+            return "FAIL", min(0.95, score + 0.05), summary
+        if score >= 0.50:
+            summary = (f"Moderate deepfake indicators — {sig_label} pattern matched "
+                       f"({sev} severity, score {score:.0%}). Artifacts: {tags_str}.")
+            return "FAIL", min(0.85, score + 0.10), summary
+        if score >= 0.30:
+            summary = (f"Ambiguous frame — low-confidence {sig_label} signals "
+                       f"below alert threshold (score {score:.0%}).")
+            return "UNKNOWN", 0.0, summary
+        summary = "No significant deepfake artifacts detected in this frame."
+        return "PASS", round(1.0 - score, 4), summary
 
     import httpx
     prompt = f"""You are a deepfake security auditor.
@@ -164,14 +180,13 @@ The verdict must be FAIL, PASS, or UNKNOWN.
                 confidence = float(verdict_data.get("confidence", 0.0))
                 if verdict not in ["PASS", "FAIL", "UNKNOWN"]:
                     verdict = "UNKNOWN"
-                return verdict, confidence
+                return verdict, confidence, f"LLM verdict: {verdict} (confidence {confidence:.0%})."
             except (json.JSONDecodeError, TypeError, KeyError) as e:
                 logger.warning(f"Malformed LLM response: '{llm_text}', error: {e}")
-                return "UNKNOWN", 0.0
-                
+                return "UNKNOWN", 0.0, "LLM response could not be parsed — verdict inconclusive."
+
     except httpx.RequestError as e:
         logger.error(f"Ollama connection failed: {e}")
-        # Treated as timeout by Aggregation Service
         raise HTTPException(status_code=503, detail="Ollama service unavailable")
 
 @app.post("/audit", response_model=AuditResult, dependencies=[Depends(verify_api_key)])
@@ -194,32 +209,30 @@ async def audit(req: AuditRequest):
     verdict = "UNKNOWN"
     matched_sig = None
     confidence = 0.0
+    summary = "No signature matched — verdict inconclusive."
 
     if results:
         doc, l2_dist = results[0]
-        # Convert L2 distance to similarity score
-        # For normalized vectors: dist_sq = 2 - 2*cos_sim => cos_sim = 1 - dist_sq/2
         similarity_score = 1.0 - (l2_dist / 2.0)
-        
         logger.info(f"Matched signature: {doc.metadata['label']} with similarity: {similarity_score:.4f}")
-        
-        # Threshold check — SCHEMA.md §9.2 requires similarity_score >= 0.75
+
         if similarity_score >= 0.75:
             matched_sig = doc.metadata["label"]
-            # Call Ollama/Mistral (or mock) to generate verdict
-            verdict, confidence = await generate_verdict_via_llm(
+            verdict, confidence, summary = await generate_verdict_via_llm(
                 req.deepfake_score,
                 doc.metadata["label"],
                 doc.page_content,
-                doc.metadata["severity"]
+                doc.metadata["severity"],
+                doc.metadata.get("artefact_tags"),
             )
-            
+
     return AuditResult(
         stream_id=req.stream_id,
         frame_index=req.frame_index,
         audit_verdict=verdict,
         matched_signature=matched_sig,
-        confidence=confidence
+        confidence=confidence,
+        summary=summary,
     )
 
 @app.get("/health")

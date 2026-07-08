@@ -857,3 +857,121 @@ Explain what remains to be done across the project, and update README.md, PLAN/P
 ### Status
 
 All Phase 1 + 2 + 2.5 work is complete. Documentation synced. 62/62 tests passing on host. Next step: Phase 3.
+
+---
+
+## Session: 2026-07-07 — WSL Fixes, Rule-Based Summaries & Dashboard UI Overhaul
+
+### Work Completed
+
+#### WSL-3 — Temporal Weights Path Fixed
+
+`docker-compose.yml` previously mounted the temporal model from a user-specific HuggingFace cache blob path (`~/.cache/huggingface/hub/models--Naman712--Deep-fake-detection/blobs/<sha>`). This path is machine-specific and broke on any fresh clone. Fixed by copying the 217 MB checkpoint to `temporal-service/weights/model_87_acc_20_frames_final_data.pt` (gitignored) and updating the `docker-compose.yml` default to the relative path. Re-download command if lost:
+
+```bash
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='Naman712/Deep-fake-detection', filename='model_87_acc_20_frames_final_data.pt', local_dir='temporal-service/weights/')"
+```
+
+#### WSL-5 — Kafka Backlog Fixed
+
+`simulate_stream.py` at 6.7 FPS fills the `frames` topic indefinitely. Consumer groups would be hundreds of thousands of messages behind, causing new eval frames to never appear on the dashboard until the backlog drained.
+
+Two fixes applied to `docker-compose.yml`:
+- `KAFKA_LOG_RETENTION_MS: 7200000` — auto-delete messages older than 2 hours
+- `KAFKA_LOG_RETENTION_BYTES: 536870912` — 512 MB cap per partition
+
+New helper `scripts/reset_kafka_offset.sh` resets one or both consumer groups to latest offset in one command:
+```bash
+bash scripts/reset_kafka_offset.sh              # both groups
+bash scripts/reset_kafka_offset.sh aggregation-only
+bash scripts/reset_kafka_offset.sh temporal-only
+```
+Script writes Kafka client properties directly into the container (avoids NTFS CRLF issues with tmpfiles), stops services, resets to latest, restarts, and prints the resulting lag.
+
+#### D2 — `langchain-community` DeprecationWarning Suppressed
+
+Attempted migration to `langchain-faiss==0.1.1` (PyPI) — that package is an unofficial stub with an empty `__init__.py`. 4 of 11 rag-agent tests failed. Reverted to `langchain-community==0.0.28`. Warning suppressed via `pytest_configure` hook in `rag-agent/tests/conftest.py` using a message-regex filter. Tests now report 11 passed, 0 warnings.
+
+#### Phase 2.5.7 — Rule-Based Summary Pipeline
+
+**`rag-agent/main.py`:**
+- `summary: str` field added to `AuditResult` Pydantic model.
+- `generate_verdict_via_llm()` now returns `Tuple[str, float, str]` (verdict, confidence, summary).
+- Four mock summary tiers keyed on `deepfake_score` × matched signature `severity` × `artefact_tags`:
+  - `score ≥ 0.80` → `"High-confidence {sig_label} detected ({sev} severity). Spatial artifacts: {tags}."` — verdict `FAIL`
+  - `score ≥ 0.50` → `"Moderate deepfake indicators — {sig_label} pattern matched..."` — verdict `FAIL`
+  - `score ≥ 0.30` → `"Ambiguous frame — low-confidence {sig_label} signals below alert threshold..."` — verdict `UNKNOWN`, confidence `0.0`
+  - `score < 0.30` → `"No significant deepfake artifacts detected in this frame."` — verdict `PASS`
+- Bug fix: UNKNOWN confidence was `0.30` (plan note); changed to `0.0` to match existing test assertion `d["confidence"] == 0.0`.
+- `artefact_tags` added to FAISS document metadata so tags flow into summary generation.
+
+**`aggregation-service/main.py`:**
+- `_latest_temporal: Dict[str, dict]` — per-stream store of `{verdict, score, low_confidence}`, updated by `temporal_audit()` endpoint.
+- `_fuse_summary(speed_summary, speed_verdict, temporal)` — combines the per-frame RAG summary with the latest temporal context into a single readable sentence. Four cases: both FAIL (corroborated), speed FAIL only (treat as unconfirmed), temporal FAIL only (flag at batch layer), both clear.
+- `summary: str` added to `AggregatedResult` model.
+- `process_frame_payload()` updated: extracts `speed_summary` from RAG response, calls `_fuse_summary()`, passes result to `AggregatedResult` and WebSocket broadcast event. `matched_signature` also added to the WebSocket event (was missing).
+
+#### Phase 2.5.8 — Dashboard UI Overhaul
+
+**`frontend/src/store.ts` — State additions:**
+- `FrameData`: `matched_signature?: string | null`, `summary?: string` (optional to keep existing tests passing without modification)
+- `TemporalAudit`: added `stream_id: string` (present in WS event, needed to reset per-stream window counter)
+- Cross-panel linking: `hoveredFrameIndex: number | null` + `setHoveredFrame`; `selectedFlaggedFrame: number | null` + `setSelectedFlaggedFrame`
+- Stream selector: `selectedStream: string | null` + `setSelectedStream`; `activeStreams: string[]` (populated automatically from incoming frames)
+- Temporal window progress: `temporalWindowProgress: number` (0–20); `streamWindowCounters: Record<string, number>` internal. Counter increments on each `addFrame`, caps at 20, resets to 0 when `setTemporalAudit` fires (new window started).
+
+**`LiveGraph.tsx` — Simplified tooltip + linking:**
+- Removed fusion formula line and RAG boost indicator from tooltip.
+- New tooltip shows: Speed score % + `[verdict]`; Temporal score % + `[verdict]` from `latestTemporalAudit`; ALERT banner only when `alert: true`.
+- `onMouseMove` on `<AreaChart>`: sets `hoveredFrameIndex` if the hovered frame exists in `flaggedFrames`; `onMouseLeave` clears it.
+- `<ReferenceDot>` rendered at the position of `selectedFlaggedFrame` when set (white ring, no fill).
+- Stream selector `<select>` dropdown rendered above chart when `activeStreams.length > 1`. Filters `displayFrames` and communicates to `FlaggedFrames` via shared `selectedStream` state.
+- `CartesianGrid` stroke changed from hardcoded `rgba(255,255,255,0.05)` to `var(--border-color)` (light-mode compatible).
+
+**`AuditPanel.tsx` — Summary + progress:**
+- Replaced hardcoded "Known threat pattern detected" with `latestFrame?.summary` displayed in a styled text block (background tint varies by verdict).
+- `matched_signature` shown as an amber pill badge below the verdict.
+- Temporal window progress bar added to the Temporal card: thin 5px bar filling `temporalWindowProgress / 20`, cyan fill, always visible when connected.
+
+**`FlaggedFrames.tsx` — Summary + bidirectional linking:**
+- `summary` text rendered below the score bar in each row, separated by a thin border.
+- Row highlight: border and background tint applied when `hoveredFrameIndex === frame.frame_index`.
+- `useEffect` on `hoveredFrameIndex` scrolls the matching row into view (`scrollIntoView({ behavior: 'smooth', block: 'nearest' })`).
+- Row `onClick` calls `setSelectedFlaggedFrame(frame.frame_index)` → causes `ReferenceDot` to appear on the graph.
+- Filter: only frames matching `selectedStream` shown when a stream is selected.
+
+**`frontend/src/index.css` — Softer palette + light mode:**
+- Dark palette softened: `--danger: #F87171`, `--warning: #FCD34D`, `--success: #4ADE80`, `--accent-blue: #60A5FA`, `--accent-cyan: #67E8F9`, `--bg-primary: #0F1117`, `--bg-secondary: #17191F`.
+- `html.light` class block: full light mode with `--bg-primary: #F1F5F9`, `--bg-secondary: #FFFFFF`, darker semantic colours for contrast (`--danger: #DC2626`, `--warning: #D97706`, etc.).
+- `html.light body` gradient override.
+- `gap-3` utility class added (was used in components but missing from CSS).
+
+**`App.tsx` — Theme toggle:**
+- `useState` added for `isDark` (default `true`).
+- `Sun` / `Moon` icons imported from `lucide-react`.
+- Toggle button added to header: calls `document.documentElement.classList.toggle('light')`.
+
+**`App.css` — Deleted** (Vite boilerplate; was not imported anywhere).
+
+#### Documentation Updates
+
+- `PLAN/SCHEMA.md` — `summary` field added to §3 (RAG Audit Verdict), §4 (Aggregated Result), and §6 (WebSocket Push Event); `matched_signature` added to §6.
+- `PLAN/PHASES.md` — Steps 2.5.7 and 2.5.8 added as completed; Phase 2.5 status header updated; exit criteria updated with summary/UI items checked off.
+- `BUGS_AND_ISSUES.md` — rag-agent count 10→11, frontend 5/5 Vitest row added, total 80→81, last-updated date updated.
+- `README.md` — Test coverage table updated (RAG 10→11, frontend Vitest row added, total 80→81); file structure updated (App.css removed, store.ts/component descriptions updated).
+
+### Test Results
+
+| Service | Tests | Result |
+|---|---|---|
+| `rag-agent` | 11 | ✅ 11/11 (UNKNOWN confidence fix; all tiers verified) |
+| `aggregation-service` | 30 | ✅ 30/30 (summary field passes through; no regressions) |
+| `temporal-service` | 20 | ✅ 20/20 (unchanged) |
+| `frontend` (Vitest) | 5 | ✅ 5/5 (new store fields are optional; no regressions) |
+| `ingest-gateway` | 4 | ✅ 4/4 (unchanged) |
+| `vision-service` | 16 | ✅ 16/16 (unchanged) |
+| **Total** | **81** | **✅ 81/81** |
+
+### Status
+
+Phase 2.5 pipeline and UI overhaul complete. Fused summaries flow end-to-end from RAG → aggregation → WebSocket → FlaggedFrames panel. Dashboard has bidirectional graph↔panel linking, stream selector, temporal window progress, light/dark mode, and a cleaned-up tooltip. 81/81 tests passing. Full 140/140 FF++ benchmark deferred to Phase 3 (gRPC throughput upgrade required).

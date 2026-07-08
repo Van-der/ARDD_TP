@@ -68,6 +68,7 @@ except Exception as e:
 alert_counters: Dict[str, int] = defaultdict(int)
 mlflow_buffer: deque = deque(maxlen=100)
 MAX_STREAMS = 1000  # cap on unique stream_id keys to prevent unbounded memory growth
+_latest_temporal: Dict[str, dict] = {}  # stream_id → {verdict, score, low_confidence}
 
 # ── Security constants ────────────────────────────────────────────────────────
 # stream_id: alphanumeric + underscore/hyphen/dot, 1–128 chars
@@ -159,6 +160,7 @@ class AggregatedResult(BaseModel):
     rag_used: bool
     latency_ms: int
     drift_flag: bool
+    summary: str
 
 class TemporalAuditResult(BaseModel):
     stream_id: str
@@ -172,6 +174,25 @@ class TemporalAuditResult(BaseModel):
     model_used: str
     latency_ms: int
     timestamp_ms: int
+
+def _fuse_summary(speed_summary: str, speed_verdict: str, temporal: Optional[dict]) -> str:
+    if temporal is None:
+        return speed_summary + " Temporal sequence analysis not yet available."
+    t_verdict = temporal["verdict"]
+    t_score = temporal["score"]
+    conf_note = " (low-confidence window — insufficient frames)" if temporal.get("low_confidence") else ""
+    if speed_verdict == "FAIL" and t_verdict == "FAIL":
+        return (speed_summary +
+                f" Corroborated by 20-frame temporal sequence (score {t_score:.0%}).{conf_note}")
+    if speed_verdict == "FAIL":
+        return (speed_summary +
+                f" Temporal sequence inconclusive ({t_verdict}, {t_score:.0%}) — treat as unconfirmed.{conf_note}")
+    if t_verdict == "FAIL":
+        return (f"Frame inconclusive at Speed Layer ({speed_summary.rstrip('.')}.)"
+                f" Current 20-frame window shows deepfake pattern "
+                f"(temporal score {t_score:.0%}).{conf_note}")
+    return speed_summary + f" Temporal sequence also clear ({t_verdict}).{conf_note}"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -371,16 +392,20 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     rag_used = False
     audit_verdict = "UNKNOWN"
     matched_signature = None
-    
+    speed_summary = "RAG agent unavailable — verdict inconclusive."
+
     try:
         rag_res = await call_rag(payload.stream_id, payload.frame_index, deepfake_score)
         rag_used = True
         audit_verdict = rag_res.get("audit_verdict", "UNKNOWN")
         matched_signature = rag_res.get("matched_signature", None)
+        speed_summary = rag_res.get("summary", "No summary returned by RAG agent.")
     except httpx.TimeoutException:
         logger.warning(f"RAG timeout exceeded {RAG_TIMEOUT}s")
     except Exception as e:
         logger.warning(f"RAG failure: {e}")
+
+    fused_summary = _fuse_summary(speed_summary, audit_verdict, _latest_temporal.get(payload.stream_id))
 
     final_score = deepfake_score
     if audit_verdict == "FAIL":
@@ -416,7 +441,8 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
         alert=alert,
         rag_used=rag_used,
         latency_ms=latency_ms,
-        drift_flag=drift_flag
+        drift_flag=drift_flag,
+        summary=fused_summary,
     )
     
     telemetry = {
@@ -454,7 +480,9 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
         "deepfake_score": final_score,
         "audit_verdict": audit_verdict,
         "alert": alert,
-        "timestamp_ms": payload.timestamp_ms
+        "timestamp_ms": payload.timestamp_ms,
+        "matched_signature": matched_signature,
+        "summary": fused_summary,
     }
     await manager.broadcast(json.dumps(ws_event))
 
@@ -497,6 +525,11 @@ async def _deliver_webhook(payload: dict, max_attempts: int = 3) -> None:
 
 @app.post("/temporal_audit", dependencies=[Depends(verify_api_key)])
 async def temporal_audit(payload: TemporalAuditResult):
+    _latest_temporal[payload.stream_id] = {
+        "verdict": payload.temporal_verdict,
+        "score": payload.temporal_score,
+        "low_confidence": payload.low_confidence_flag,
+    }
     ws_event = {
         "type": "temporal_audit",
         **payload.model_dump()

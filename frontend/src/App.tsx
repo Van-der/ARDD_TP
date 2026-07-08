@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react';
-import { ShieldCheck, Activity, ServerCrash, AlertCircle } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { ShieldCheck, Activity, ServerCrash, AlertCircle, Sun, Moon } from 'lucide-react';
 import { useStore } from './store';
 import { LiveGraph } from './components/LiveGraph';
 import { AuditPanel } from './components/AuditPanel';
@@ -18,6 +18,13 @@ const MAX_RECONNECT_ATTEMPTS = 8;
 const BASE_BACKOFF_MS = 500;
 
 export default function App() {
+  const [isDark, setIsDark] = useState(true);
+
+  const toggleTheme = () => {
+    document.documentElement.classList.toggle('light');
+    setIsDark(d => !d);
+  };
+
   const {
     token, setToken,
     connected, setConnected,
@@ -168,6 +175,23 @@ export default function App() {
               <ShieldCheck size={14} /> Live Stream
             </div>
           )}
+          <button
+            onClick={toggleTheme}
+            title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            style={{
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-color)',
+              borderRadius: '8px',
+              color: 'var(--text-secondary)',
+              cursor: 'pointer',
+              padding: '0.4rem 0.6rem',
+              display: 'flex',
+              alignItems: 'center',
+              transition: 'background 0.2s',
+            }}
+          >
+            {isDark ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
         </div>
       </header>
 

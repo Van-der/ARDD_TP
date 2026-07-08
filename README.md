@@ -274,16 +274,16 @@ ARDD_TP/
 │   │   ├── favicon.svg
 │   │   └── icons.svg
 │   └── src/
-│       ├── App.tsx            # WebSocket connection, JWT auth, reconnection logic
-│       ├── App.css
-│       ├── index.css
+│       ├── App.tsx            # WebSocket connection, JWT auth, reconnection logic, theme toggle
+│       ├── index.css          # Softened dark palette + html.light mode
 │       ├── main.tsx
-│       ├── store.ts           # Zustand state: frames, alerts, JWT, connection status, verdictCounts
+│       ├── store.ts           # Zustand state: frames, alerts, JWT, verdictCounts, cross-panel linking, stream selector, window progress
 │       ├── store.test.ts
 │       └── components/
 │           ├── AlertBanner.tsx    # Consecutive-alert warning banner
-│           ├── AuditPanel.tsx     # Temporal batch audit results display
-│           └── LiveGraph.tsx      # Real-time deepfake score chart (Recharts)
+│           ├── AuditPanel.tsx     # RAG summary, matched_signature pill, window progress bar
+│           ├── FlaggedFrames.tsx  # Flagged frame rows with summary, hover-highlight, click-to-graph
+│           └── LiveGraph.tsx      # Recharts score graph, simplified tooltip, stream selector, ReferenceDot
 │
 ├── tests/
 │   └── e2e/
@@ -316,10 +316,11 @@ ARDD_TP/
 |---|---|---|
 | Ingest Gateway | 4 | Kafka publish, FPS downsampling, SASL config, auth |
 | Vision Service | 16 | Spatial branch, frequency branch, score formula, alignment failure, payload limits, auth |
-| RAG Agent | 10 | FAISS search, verdict generation, similarity threshold, payload validation, auth |
+| RAG Agent | 11 | FAISS search, verdict tiers (score × severity × tags), summary field, similarity threshold, payload validation, auth |
 | Aggregation Service | 30 | Full pipeline, Vision 502, RAG timeout, WebSocket JWT, alert window, drift, temporal audit, MLflow buffer, stream_id validation, payload size guard, rate limiting, SASL env vars |
 | Temporal Service | 20 | Buffer fill, tensor shape, zero-padding, sparse fallback, full inference, interpolation, schema validation, auth |
-| **Total** | **80** | **All 80 pass on host (Python 3.13.13)** |
+| Frontend (Vitest) | 5 | Zustand store: frame buffer cap, sticky alert, dismiss, connection state, temporal status |
+| **Total** | **81** | **All 81 pass on host (Python 3.13.13 + Node 24)** |
 
 > Vision-service tests run natively on the host — the Python 3.14 / facenet-pytorch incompatibility no longer applies (host is Python 3.13.13).
 

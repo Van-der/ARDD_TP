@@ -384,7 +384,7 @@ docker run -e PYTHONPATH=/app -v $(pwd)/temporal-service:/app --rm ardd-temporal
 
 **Goal:** Replace the heuristic FFT frequency branch with a trained MLP, and fine-tune the full EfficientNet-B4 spatial branch on FaceForensics++ (FF++) data. After this phase the Vision Service runs a fully trained dual-branch model instead of the ImageNet-pretrained + heuristic combination.
 
-> **Status:** Training complete 2026-06-17. All five pre-training files written and tested. EfficientNet-B4 fine-tuned on FF++ c23 (10 epochs, RTX 4050 6GB, AMP FP16). Test AUC 0.9987. Step 2.5.6 benchmark run in progress (WebSocket/Kafka pipeline issue being resolved).
+> **Status (2026-07-07):** Training complete 2026-06-17. EfficientNet-B4 fine-tuned on FF++ c23 (10 epochs, RTX 4050 6GB, AMP FP16). Test AUC 0.9987. Kafka pipeline issues resolved (WSL-3, WSL-5). Rule-based summary pipeline and dashboard UI overhaul complete (Steps 2.5.7–2.5.8). Smoke-test benchmark passed (2+2 videos, AUC 1.0000). Full 140/140 benchmark deferred to Phase 3 (requires gRPC throughput upgrade).
 
 **Prerequisites:** Phase 2 complete. FaceForensics++ dataset downloaded (1000 real + 2000 fake, c23 compression). `nvidia-container-toolkit` installed and configured.
 
@@ -448,12 +448,24 @@ ls model-weights/
 - [x] Volume mounts for all three weight files: `efficientnet_b4_ff++.pt`, `fft_mlp_ff++.pt`, `fusion_alpha.npy`
 - [x] Env vars `MODEL_WEIGHTS_PATH`, `FFT_MLP_WEIGHTS_PATH`, `FUSION_WEIGHTS_PATH` wired to container paths
 
-### Step 2.5.6 — Benchmark with `video_feeder.py`
-- [ ] Run `python video_feeder.py --mode eval` against FF++ test set (140 real + 140 fake videos)
-- [ ] Collect temporal and speed layer verdicts; calculate AUC, precision, recall
-- [ ] Document results in `README.md` benchmark table
+### Step 2.5.6 — Benchmark with `video_feeder.py` ⚠️ PARTIAL
+- [x] Smoke test (2 real + 2 fake videos, 30 frames, 3 FPS): AUC=1.0000, Accuracy=1.0000, Precision=1.0000, Recall=1.0000
+- [ ] Full run against FF++ test set (140 real + 140 fake videos) — deferred to Phase 3 (requires gRPC throughput upgrade to sustain 10+ FPS pipeline)
+- [ ] Document full results in `README.md` benchmark table
 
 > **Note:** Both `aggregation-service` and `temporal-service` Kafka consumer tasks now have a retry loop (2026-06-18 fix) — if Kafka is not ready at startup the consumer retries every 5s automatically. `<StrictMode>` removed from frontend — WebSocket cycling issue resolved.
+
+### Step 2.5.7 — Rule-Based Summary Pipeline ✅ COMPLETED 2026-07-07
+- [x] `rag-agent/main.py`: `summary: str` added to `AuditResult`; `generate_verdict_via_llm()` returns 4-tier rule-based summaries based on deepfake score × matched signature severity × `artefact_tags` (high/moderate/ambiguous/clean)
+- [x] `aggregation-service/main.py`: `_latest_temporal: Dict[str, dict]` — per-stream store updated by `temporal_audit()` endpoint; `_fuse_summary()` combines per-frame Speed Layer summary with latest temporal verdict; `summary` added to `AggregatedResult` model; `summary` and `matched_signature` added to WebSocket broadcast event
+
+### Step 2.5.8 — Dashboard UI Overhaul ✅ COMPLETED 2026-07-07
+- [x] `store.ts`: `matched_signature?`, `summary?` on `FrameData`; `stream_id` on `TemporalAudit`; cross-panel linking state (`hoveredFrameIndex`, `selectedFlaggedFrame`); stream selector state (`selectedStream`, `activeStreams`); temporal window progress tracking (`temporalWindowProgress`, `streamWindowCounters`)
+- [x] `LiveGraph.tsx`: simplified tooltip showing Speed + Temporal scores with verdicts (fusion formula removed); bidirectional graph↔panel linking via `hoveredFrameIndex`; stream selector `<select>` dropdown (shown when >1 active stream); `<ReferenceDot>` for panel-selected frame
+- [x] `AuditPanel.tsx`: fused summary text from latest frame; `matched_signature` pill badge; temporal window progress bar (0–20 frames)
+- [x] `FlaggedFrames.tsx`: summary line per row; hover-highlight + auto-scroll driven by `hoveredFrameIndex`; click-to-select sets `selectedFlaggedFrame` for graph dot; filter by `selectedStream`
+- [x] `index.css`: softened dark palette (F87171/FCD34D/4ADE80/60A5FA/67E8F9); full light mode via `html.light` class; `gap-3` utility added; `html.light body` gradient override
+- [x] `App.tsx`: Sun/Moon theme toggle button in header; `App.css` deleted (was Vite boilerplate)
 
 **Phase 2.5 exit criteria:**
 - [x] `FftMlp`, `extract_faces.py`, `train_vision.py`, updated `vision-service/main.py`, updated `docker-compose.yml` all complete
@@ -461,7 +473,10 @@ ls model-weights/
 - [x] Vision Service loads trained weights on startup (`spatial_trained: true`, `fft_mlp_trained: true`, `fusion_trained: true` in `/health`)
 - [x] Speed layer test accuracy 99.41%, AUC 0.9987 on FF++ Deepfakes c23 test set
 - [x] README benchmark table populated with val/test accuracy
-- [ ] `video_feeder.py --mode eval` end-to-end benchmark run and results verified
+- [x] Kafka pipeline verified end-to-end; WSL-3 (temporal weights path) and WSL-5 (Kafka backlog) resolved
+- [x] Rule-based fused summaries flowing from RAG → Aggregation → WebSocket → Dashboard
+- [x] Dashboard UI overhaul complete (tooltip, AuditPanel, FlaggedFrames, light/dark mode, stream selector, window progress)
+- [ ] Full 140/140 benchmark run (deferred — see Step 2.5.6)
 
 ---
 

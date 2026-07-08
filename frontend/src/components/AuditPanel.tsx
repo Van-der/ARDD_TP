@@ -3,7 +3,10 @@ import { useStore } from '../store';
 import { Clock, Search, ShieldAlert, CheckCircle2, HelpCircle, BarChart2 } from 'lucide-react';
 
 export const AuditPanel = () => {
-  const { frames, latestTemporalAudit, connected, verdictCounts, resetVerdictCounts, temporalServiceStatus } = useStore();
+  const {
+    frames, latestTemporalAudit, connected, verdictCounts, resetVerdictCounts,
+    temporalServiceStatus, temporalWindowProgress,
+  } = useStore();
   const latestFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
   const renderVerdictBadge = (verdict: string) => {
@@ -22,32 +25,78 @@ export const AuditPanel = () => {
           <Search size={18} />
           <h3 style={{ fontSize: '1rem' }}>Context Agent (RAG)</h3>
         </div>
-        
+
         {latestFrame ? (
           <div className="flex-col gap-2">
             <div className="flex-row justify-between">
               <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Instant Verdict</span>
               {renderVerdictBadge(latestFrame.audit_verdict)}
             </div>
-            {latestFrame.audit_verdict === 'FAIL' && (
-              <div style={{ marginTop: '0.5rem', padding: '0.75rem', background: 'rgba(239, 68, 68, 0.1)', borderRadius: '8px', border: '1px solid rgba(239, 68, 68, 0.2)', fontSize: '0.85rem' }}>
-                <span style={{ color: 'var(--danger)', fontWeight: 600 }}>Signature Match: </span>
-                Known threat pattern detected.
-              </div>
+
+            {latestFrame.matched_signature && (
+              <span style={{
+                display: 'inline-flex',
+                alignSelf: 'flex-start',
+                padding: '0.2rem 0.6rem',
+                borderRadius: '9999px',
+                fontSize: '0.72rem',
+                fontWeight: 600,
+                background: 'rgba(252, 211, 77, 0.12)',
+                color: 'var(--warning)',
+                border: '1px solid rgba(252, 211, 77, 0.25)',
+              }}>
+                {latestFrame.matched_signature}
+              </span>
             )}
+
+            <div style={{
+              marginTop: '0.25rem',
+              padding: '0.75rem',
+              background: latestFrame.audit_verdict === 'FAIL'
+                ? 'rgba(248, 113, 113, 0.08)'
+                : 'rgba(255,255,255,0.04)',
+              borderRadius: '8px',
+              border: `1px solid ${latestFrame.audit_verdict === 'FAIL' ? 'rgba(248,113,113,0.18)' : 'var(--border-color)'}`,
+              fontSize: '0.82rem',
+              color: 'var(--text-secondary)',
+              lineHeight: 1.5,
+            }}>
+              {latestFrame.summary ?? 'Awaiting analysis...'}
+            </div>
           </div>
         ) : (
           <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Awaiting frame data...</span>
         )}
       </div>
 
-      {/* Temporal Batch Panel (Batch Layer - Phase 2) */}
+      {/* Temporal Batch Panel */}
       <div className="card flex-col gap-4">
         <div className="flex-row gap-2" style={{ color: 'var(--warning)' }}>
           <Clock size={18} />
           <h3 style={{ fontSize: '1rem' }}>Temporal Sequence Audit</h3>
         </div>
-        
+
+        {/* Window progress bar — always shown when connected */}
+        {connected && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.3rem' }}>
+              <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Window progress</span>
+              <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                {temporalWindowProgress} / 20
+              </span>
+            </div>
+            <div style={{ background: 'var(--border-color)', borderRadius: '4px', height: '5px', overflow: 'hidden' }}>
+              <div style={{
+                width: `${(temporalWindowProgress / 20) * 100}%`,
+                height: '100%',
+                background: 'var(--accent-cyan)',
+                borderRadius: '4px',
+                transition: 'width 0.2s ease',
+              }} />
+            </div>
+          </div>
+        )}
+
         {!connected ? (
           <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Offline</span>
         ) : latestTemporalAudit !== null ? (
@@ -69,9 +118,9 @@ export const AuditPanel = () => {
                 {((1 - latestTemporalAudit.temporal_score) * 100).toFixed(1)}% confident real
               </span>
             </div>
-            
+
             {latestTemporalAudit.low_confidence_flag && (
-              <div style={{ marginTop: '0.5rem', padding: '0.5rem', background: 'rgba(245, 158, 11, 0.1)', borderRadius: '8px', border: '1px solid rgba(245, 158, 11, 0.2)', fontSize: '0.8rem', color: 'var(--warning)' }}>
+              <div style={{ padding: '0.5rem', background: 'rgba(252,211,77,0.08)', borderRadius: '8px', border: '1px solid rgba(252,211,77,0.2)', fontSize: '0.8rem', color: 'var(--warning)' }}>
                 Warning: Incomplete buffer (padding applied).
               </div>
             )}
@@ -86,6 +135,7 @@ export const AuditPanel = () => {
           </span>
         )}
       </div>
+
       {/* Verdict Tally */}
       <div className="card flex-col gap-3">
         <div className="flex-row justify-between" style={{ alignItems: 'flex-start' }}>
@@ -105,15 +155,15 @@ export const AuditPanel = () => {
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem' }}>
-          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(34,197,94,0.08)', borderRadius: '8px', border: '1px solid rgba(34,197,94,0.2)' }}>
+          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(74,222,128,0.08)', borderRadius: '8px', border: '1px solid rgba(74,222,128,0.18)' }}>
             <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--success)' }}>{verdictCounts.PASS}</div>
             <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>Real windows</div>
           </div>
-          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(239,68,68,0.08)', borderRadius: '8px', border: '1px solid rgba(239,68,68,0.2)' }}>
+          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(248,113,113,0.08)', borderRadius: '8px', border: '1px solid rgba(248,113,113,0.18)' }}>
             <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--danger)' }}>{verdictCounts.FAIL}</div>
             <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>Fake windows</div>
           </div>
-          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(107,114,128,0.08)', borderRadius: '8px', border: '1px solid rgba(107,114,128,0.2)' }}>
+          <div style={{ textAlign: 'center', padding: '0.6rem', background: 'rgba(107,114,128,0.08)', borderRadius: '8px', border: '1px solid rgba(107,114,128,0.18)' }}>
             <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-muted)' }}>{verdictCounts.UNKNOWN}</div>
             <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>Unknown</div>
           </div>

@@ -7,9 +7,12 @@ export interface FrameData {
   deepfake_score: number;
   audit_verdict: string;
   alert: boolean;
+  matched_signature?: string | null;
+  summary?: string;
 }
 
 export interface TemporalAudit {
+  stream_id: string;
   window_duration_s: number;
   temporal_score: number;
   temporal_verdict: string;
@@ -57,6 +60,21 @@ interface AppState {
   activeAlert: boolean;
   alertConsecutiveCount: number;
   dismissAlert: () => void;
+
+  // Cross-panel linking: graph hover ↔ flagged frames panel
+  hoveredFrameIndex: number | null;
+  setHoveredFrame: (idx: number | null) => void;
+  selectedFlaggedFrame: number | null;
+  setSelectedFlaggedFrame: (idx: number | null) => void;
+
+  // Stream selector
+  selectedStream: string | null;
+  setSelectedStream: (id: string | null) => void;
+  activeStreams: string[];
+
+  // Temporal window progress (0–20 frames accumulated since last window)
+  temporalWindowProgress: number;
+  streamWindowCounters: Record<string, number>;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -76,21 +94,41 @@ export const useStore = create<AppState>((set) => ({
     const newFlagged = frame.deepfake_score > 0.5
       ? [...state.flaggedFrames, frame].slice(-30)
       : state.flaggedFrames;
-    // Sticky alert: once fired, stays until dismissed; count all incoming alert frames
     const newCount = frame.alert ? state.alertConsecutiveCount + 1 : state.alertConsecutiveCount;
     const newAlert = state.activeAlert || frame.alert;
-    return { frames: newFrames, flaggedFrames: newFlagged, activeAlert: newAlert, alertConsecutiveCount: newCount };
+    const newActiveStreams = state.activeStreams.includes(frame.stream_id)
+      ? state.activeStreams
+      : [...state.activeStreams, frame.stream_id];
+    const prev = state.streamWindowCounters[frame.stream_id] ?? 0;
+    const newStreamCounter = Math.min(prev + 1, 20);
+    const newCounters = { ...state.streamWindowCounters, [frame.stream_id]: newStreamCounter };
+    const relevantStream = state.selectedStream ?? frame.stream_id;
+    return {
+      frames: newFrames,
+      flaggedFrames: newFlagged,
+      activeAlert: newAlert,
+      alertConsecutiveCount: newCount,
+      activeStreams: newActiveStreams,
+      streamWindowCounters: newCounters,
+      temporalWindowProgress: newCounters[relevantStream] ?? 0,
+    };
   }),
   clearFrames: () => set({ frames: [], flaggedFrames: [] }),
 
   latestTemporalAudit: null,
-  setTemporalAudit: (audit) => set((state) => ({
-    latestTemporalAudit: audit,
-    verdictCounts: {
-      ...state.verdictCounts,
-      [audit.temporal_verdict]: (state.verdictCounts[audit.temporal_verdict as keyof VerdictCounts] ?? 0) + 1,
-    },
-  })),
+  setTemporalAudit: (audit) => set((state) => {
+    const newCounters = { ...state.streamWindowCounters, [audit.stream_id]: 0 };
+    const relevantStream = state.selectedStream ?? audit.stream_id;
+    return {
+      latestTemporalAudit: audit,
+      verdictCounts: {
+        ...state.verdictCounts,
+        [audit.temporal_verdict]: (state.verdictCounts[audit.temporal_verdict as keyof VerdictCounts] ?? 0) + 1,
+      },
+      streamWindowCounters: newCounters,
+      temporalWindowProgress: newCounters[relevantStream] ?? 0,
+    };
+  }),
 
   temporalServiceStatus: 'unknown',
   setTemporalServiceStatus: (temporalServiceStatus) => set({ temporalServiceStatus }),
@@ -100,5 +138,24 @@ export const useStore = create<AppState>((set) => ({
 
   activeAlert: false,
   alertConsecutiveCount: 0,
-  dismissAlert: () => set({ activeAlert: false, alertConsecutiveCount: 0 })
+  dismissAlert: () => set({ activeAlert: false, alertConsecutiveCount: 0 }),
+
+  hoveredFrameIndex: null,
+  setHoveredFrame: (hoveredFrameIndex) => set({ hoveredFrameIndex }),
+  selectedFlaggedFrame: null,
+  setSelectedFlaggedFrame: (selectedFlaggedFrame) => set({ selectedFlaggedFrame }),
+
+  selectedStream: null,
+  setSelectedStream: (selectedStream) => set((state) => {
+    const progress = selectedStream !== null
+      ? (state.streamWindowCounters[selectedStream] ?? 0)
+      : (state.frames.length > 0
+          ? (state.streamWindowCounters[state.frames[state.frames.length - 1].stream_id] ?? 0)
+          : 0);
+    return { selectedStream, temporalWindowProgress: progress };
+  }),
+  activeStreams: [],
+
+  temporalWindowProgress: 0,
+  streamWindowCounters: {},
 }));
