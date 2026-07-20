@@ -2,14 +2,19 @@
 """
 FF++ Video Feeder — publishes real FaceForensics++ frames to Kafka.
 
-Three modes:
-  demo   Alternates between one real and one fake video every --switch-every
-         seconds. Watch the dashboard live as the Temporal Audit flips.
-  eval   Streams all real videos then all fake videos sequentially,
-         collecting pipeline scores via WebSocket and computing AUC/accuracy.
-  mix    Interleaves 20-frame blocks of real and fake on a SINGLE stream_id
-         ("ff_mix"). Each block exactly fills one temporal window, so the
-         Temporal Audit flips cleanly between Authentic/Fake every ~2s at 10 FPS.
+Four modes:
+  demo         Alternates between one real and one fake video every --switch-every
+               seconds. Watch the dashboard live as the Temporal Audit flips.
+  eval         Streams all real videos then all fake videos sequentially,
+               collecting pipeline scores via WebSocket and computing AUC/accuracy.
+  mix          Interleaves 20-frame blocks of real and fake on a SINGLE stream_id
+               ("ff_mix"). Each block exactly fills one temporal window, so the
+               Temporal Audit flips cleanly between Authentic/Fake every ~2s at 10 FPS.
+  multistream  Replays a SINGLE local video under N distinct stream_id tags
+               concurrently (cam_01, cam_02, ...). Validates Kafka partitioning /
+               consumer-group rebalance / load-balancer routing MECHANICS under N
+               concurrent logical streams — NOT a proxy for real camera diversity,
+               since every stream replays the same source bytes.
 
 Usage:
   # Demo (default, 15s per video):
@@ -26,6 +31,9 @@ Usage:
   # offset before a large eval run to avoid processing old backlogs.
   # See BUGS_AND_ISSUES.md §INCOMPLETE-1 for the reset procedure.
   python video_feeder.py --mode eval --max-videos 140 --fps 1
+
+  # Multi-stream concurrency test (3 simulated streams, same source video):
+  python video_feeder.py --mode multistream --streams 3 --max-frames 60 --fps 5
 """
 
 import os
@@ -47,18 +55,22 @@ FAKE_DIR = DATASET_ROOT / "manipulated_sequences" / "Deepfakes" / "c23" / "video
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
 KAFKA_TOPIC = "frames"
-API_BASE = os.getenv("EVAL_API_URL", "http://localhost:8003")
-WS_URL = os.getenv("EVAL_WS_URL", "ws://localhost:8003/stream")
+API_BASE = os.getenv("EVAL_API_URL", "https://localhost:8003")
+WS_URL = os.getenv("EVAL_WS_URL", "wss://localhost:8003/stream")
+CA_CERT = os.getenv("CA_CERT", str(Path(__file__).parent / "certs" / "ca.crt"))
 
 
 def make_producer() -> KafkaProducer:
+    ssl_kwargs = {"ssl_cafile": CA_CERT} if os.path.exists(CA_CERT) else {}
+    security_protocol = "SASL_SSL" if ssl_kwargs else "SASL_PLAINTEXT"
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
-        security_protocol="SASL_PLAINTEXT",
+        security_protocol=security_protocol,
         sasl_mechanism="PLAIN",
         sasl_plain_username="admin",
         sasl_plain_password="admin-secret",
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        **ssl_kwargs,
     )
 
 
@@ -98,7 +110,7 @@ def send_video(producer: KafkaProducer, video_path: Path, stream_id: str,
                 "timestamp_ms": int(time.time() * 1000),
                 "payload": base64.b64encode(buf.tobytes()).decode("utf-8"),
             }
-            producer.send(KAFKA_TOPIC, payload)
+            producer.send(KAFKA_TOPIC, payload, key=stream_id.encode("utf-8"))
             frame_index += 1
 
             sys.stdout.write(
@@ -214,7 +226,7 @@ def run_mix(fps: int) -> None:
                         "frame_index": frame_index,
                         "timestamp_ms": int(time.time() * 1000),
                         "payload": base64.b64encode(buf.tobytes()).decode("utf-8"),
-                    })
+                    }, key=stream_id.encode("utf-8"))
                     frame_index += 1
                     sent += 1
                     sys.stdout.write(f"\r    frame {frame_index:5d}  block {sent:2d}/20")
@@ -234,18 +246,61 @@ def run_mix(fps: int) -> None:
         producer.close()
 
 
+def run_multistream(fps: int, streams: int, max_frames: int, source: str) -> None:
+    """Replay a single local video under N distinct stream_id tags concurrently.
+
+    This validates Kafka partitioning / consumer-group rebalance / load-balancer
+    routing MECHANICS under N concurrent logical streams. It is NOT a proxy for
+    real-world camera diversity — every simulated stream replays the same source
+    video's bytes.
+    """
+    videos = sorted(REAL_DIR.glob("*.mp4")) if source == "real" else sorted(FAKE_DIR.glob("*.mp4"))
+    if not videos:
+        print(f"[ERROR] No {source} videos found. Check datasets/ff++ structure.")
+        return
+
+    video_path = videos[0]
+    producer = make_producer()  # kafka-python's KafkaProducer.send() is thread-safe
+
+    print(f"Multi-stream mode — replaying {video_path.name} ({source}) as "
+          f"{streams} concurrent simulated streams at {fps} FPS")
+    print("NOTE: validates partitioning/rebalance/load-balancer routing mechanics only —")
+    print("      not a proxy for real camera diversity (all streams share source bytes).\n")
+
+    def worker(idx: int) -> None:
+        stream_id = f"cam_{idx:02d}"
+        send_video(producer, video_path, stream_id=stream_id,
+                   fps=fps, max_frames=max_frames, label=source.upper())
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(1, streams + 1)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        producer.close()
+
+
 def _get_jwt_token() -> str | None:
     """Fetch a JWT token from the aggregation-service auth endpoint."""
     try:
+        import ssl
         import urllib.request
-        body = json.dumps({"client_id": "eval_runner", "client_secret": "eval_runner"}).encode()
+        # RBAC (M11): only the hardcoded admin/viewer pairs authenticate now —
+        # this script just reads WebSocket scores, so viewer is sufficient.
+        body = json.dumps({"client_id": "viewer", "client_secret": "viewer-secret-change-me"}).encode()
         req = urllib.request.Request(
             f"{API_BASE}/auth/token",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        ctx = ssl.create_default_context(cafile=CA_CERT) if os.path.exists(CA_CERT) else None
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
             return json.loads(resp.read())["access_token"]
     except Exception as e:
         print(f"  [WARN] Could not get JWT token: {e}")
@@ -269,10 +324,12 @@ class _WsCollector(threading.Thread):
             import websocket as ws_lib
             # Use subprotocols= (not header=) so websocket-client handles the
             # Sec-WebSocket-Protocol handshake correctly with Starlette's accept().
+            sslopt = {"ca_certs": CA_CERT} if os.path.exists(CA_CERT) else None
             ws = ws_lib.create_connection(
                 WS_URL,
                 subprotocols=[self.token],
                 timeout=10,
+                sslopt=sslopt,
             )
             ws.settimeout(1.0)
             while not self._stop.is_set():
@@ -417,7 +474,7 @@ def run_eval(fps: int, max_videos: int, max_frames: int = 0) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FF++ Video Feeder for ARDD-TP")
-    parser.add_argument("--mode", choices=["demo", "eval", "mix"], default="demo")
+    parser.add_argument("--mode", choices=["demo", "eval", "mix", "multistream"], default="demo")
     parser.add_argument("--fps", type=int, default=10,
                         help="Frames per second to publish (default: 10)")
     parser.add_argument("--switch-every", type=int, default=15,
@@ -426,6 +483,10 @@ def main() -> None:
                         help="Eval mode: max videos per class (0 = all, 140 = FF++ test split)")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="Eval mode: max frames per video (0 = all). Use 20-50 for quick pipeline smoke tests")
+    parser.add_argument("--streams", type=int, default=3,
+                        help="Multistream mode: number of concurrent simulated stream_ids (default: 3)")
+    parser.add_argument("--source", choices=["real", "fake"], default="fake",
+                        help="Multistream mode: replay a real or fake video (default: fake)")
     args = parser.parse_args()
 
     if not REAL_DIR.exists() or not FAKE_DIR.exists():
@@ -439,6 +500,9 @@ def main() -> None:
         run_demo(fps=args.fps, switch_every=args.switch_every)
     elif args.mode == "mix":
         run_mix(fps=args.fps)
+    elif args.mode == "multistream":
+        run_multistream(fps=args.fps, streams=args.streams,
+                         max_frames=args.max_frames, source=args.source)
     else:
         run_eval(fps=args.fps, max_videos=args.max_videos, max_frames=args.max_frames)
 

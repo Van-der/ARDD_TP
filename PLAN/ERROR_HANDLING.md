@@ -70,10 +70,10 @@ All failure scenarios, their detection points, responses, and logging behaviour.
 | Scenario | Detection | Response | Logged |
 |---|---|---|---|
 | Timeout (>100ms) | Aggregation Service deadline exceeded | Aggregation resolves with Vision score only; `audit_verdict: "UNKNOWN"`, `rag_used: false` | Yes — MLflow |
-| No matching signature | FAISS/ChromaDB returns empty result | Return `audit_verdict: "UNKNOWN"`, `matched_signature: null` | No |
+| No matching signature | ChromaDB (M7) returns empty result | Return `audit_verdict: "UNKNOWN"`, `matched_signature: null` | No |
 | LLM (Ollama) unavailable | HTTP connection error | Return `503 Service Unavailable`; treated as timeout by Aggregation Service | Yes — service logs |
 | Unidentifiable input | Guardrail triggered | Return `audit_verdict: "UNKNOWN"`, `confidence: 0.0` | Yes — MLflow |
-| Vector store unavailable | FAISS/ChromaDB connection error | Return `503`; treated as timeout by Aggregation Service | Yes — service logs |
+| Vector store unavailable | ChromaDB (M7) connection error | Return `503`; treated as timeout by Aggregation Service | Yes — service logs |
 | LLM returns malformed response | JSON parse error on LLM output | Return `audit_verdict: "UNKNOWN"`, `confidence: 0.0` | Yes — service logs |
 
 ---

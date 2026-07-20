@@ -105,7 +105,7 @@ def test_kafka_publish_retry(monkeypatch):
     call_count = {"n": 0}
 
     class MockProducer:
-        def send(self, topic, payload):
+        def send(self, topic, payload, key=None):
             call_count["n"] += 1
             raise Exception("Kafka broker unavailable")
 

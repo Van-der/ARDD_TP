@@ -98,7 +98,7 @@ Both layers feed into the **Aggregation Service**, which merges results and push
 
 ### RAG Context Agent
 - **Role:** Semantic search against known threat signatures, conditioned on the Vision score.
-- **Tech:** LangChain, FAISS/ChromaDB, Ollama/Mistral.
+- **Tech:** LangChain, ChromaDB (persistent, M7 — replaced the original in-memory FAISS store), Ollama/Mistral.
 - **Input:** Vision score + stream metadata. **Output:** `RAGAuditVerdict`.
 
 ### Aggregation Service

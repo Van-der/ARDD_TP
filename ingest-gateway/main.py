@@ -11,19 +11,28 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_KAFKA_SECURITY_PROTOCOL = os.getenv('KAFKA_SECURITY_PROTOCOL', 'PLAINTEXT')
+_KAFKA_SECURITY_PROTOCOL = os.getenv('KAFKA_SECURITY_PROTOCOL', 'SASL_SSL')
 _KAFKA_SASL_USERNAME = os.getenv('KAFKA_SASL_USERNAME', '')
 _KAFKA_SASL_PASSWORD = os.getenv('KAFKA_SASL_PASSWORD', '')
+_CA_CERT = os.getenv('CA_CERT', '/certs/ca.crt')
 
 def _kafka_sasl_kwargs() -> dict:
-    if _KAFKA_SECURITY_PROTOCOL == 'SASL_PLAINTEXT':
-        return {
-            'security_protocol': 'SASL_PLAINTEXT',
-            'sasl_mechanism': 'PLAIN',
-            'sasl_plain_username': _KAFKA_SASL_USERNAME,
-            'sasl_plain_password': _KAFKA_SASL_PASSWORD,
-        }
-    return {}
+    protocol = _KAFKA_SECURITY_PROTOCOL
+    if protocol not in ('SASL_PLAINTEXT', 'SASL_SSL'):
+        return {}
+    kwargs = {
+        'security_protocol': protocol,
+        'sasl_mechanism': 'PLAIN',
+        'sasl_plain_username': _KAFKA_SASL_USERNAME,
+        'sasl_plain_password': _KAFKA_SASL_PASSWORD,
+    }
+    if protocol == 'SASL_SSL':
+        if os.path.exists(_CA_CERT):
+            kwargs['ssl_cafile'] = _CA_CERT
+        else:
+            logger.warning(f"CA_CERT '{_CA_CERT}' not found — falling back to SASL_PLAINTEXT")
+            kwargs['security_protocol'] = 'SASL_PLAINTEXT'
+    return kwargs
 
 class IngestGateway:
     def __init__(self):
@@ -76,7 +85,7 @@ class IngestGateway:
                 "stream_id": self.stream_id,
                 "timestamp_ms": int(time.time() * 1000),
                 "reason": "stream_unreachable_after_5_attempts"
-            })
+            }, key=self.stream_id.encode("utf-8"))
             self.producer.flush()
         except Exception:
             pass
@@ -123,7 +132,7 @@ class IngestGateway:
         # Kafka publish with 3-attempt retry and exponential backoff
         for attempt in range(1, 4):
             try:
-                self.producer.send(self.kafka_topic, payload)
+                self.producer.send(self.kafka_topic, payload, key=self.stream_id.encode("utf-8"))
                 self.frame_index += 1
                 logger.debug(f"Published frame {self.frame_index} to Kafka")
                 return True

@@ -2,10 +2,14 @@ from locust import HttpUser, task, between
 import time
 import base64
 import os
+import cv2
+import numpy as np
 
-# Generate a small 10x10 mock image in base64 to avoid network overhead for the payload itself
-# (In a real load test, you might want to use a real 224x224 frame)
-MOCK_PAYLOAD = base64.b64encode(b"\x00" * 300).decode("utf-8")
+# A real encoded JPEG is required — vision-service's cv2.imdecode() rejects
+# raw non-JPEG bytes with a 422, which previously made every request fail.
+_mock_frame = np.zeros((224, 224, 3), dtype=np.uint8)
+_, _mock_jpeg = cv2.imencode(".jpg", _mock_frame)
+MOCK_PAYLOAD = base64.b64encode(_mock_jpeg.tobytes()).decode("utf-8")
 API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
 
 class DeepfakeLoadTest(HttpUser):

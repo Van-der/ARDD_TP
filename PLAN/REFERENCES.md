@@ -83,6 +83,6 @@ Referenced as a cross-dataset generalisation benchmark.
 | `facenet-pytorch` | 2.6.x | MTCNN face alignment (Vision Service) |
 | `aiokafka` | 0.x | Async Kafka consumers (Aggregation + Temporal Service) |
 | `langchain` / `langchain-community` | 0.x | RAG pipeline (RAG Agent) |
-| `sentence-transformers` | 2.x | Semantic embeddings for FAISS threat signature search (Phase 2) |
-| `faiss-cpu` | 1.x | Vector similarity search (RAG Agent) |
+| `sentence-transformers` | 2.x | Semantic embeddings for threat signature search (Phase 2) |
+| `chromadb` | 0.4.24 (container) / 1.5.9 (host tests) | Persistent vector similarity search (RAG Agent) — replaced `faiss-cpu` in M7 |
 | `mlflow` | 2.x | Experiment tracking and drift detection |

@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from main import app, INTERNAL_API_KEY
+from main import app, INTERNAL_API_KEY, init_vector_store
 
 client = TestClient(app)
 HEADERS = {"X-API-Key": INTERNAL_API_KEY}
@@ -118,3 +118,32 @@ def test_audit_full_schema():
     assert 0.0 <= d["confidence"] <= 1.0
     assert d["stream_id"] == "schema_test"
     assert d["frame_index"] == 5
+
+
+# ── Chroma persistence + regression against pre-swap behavior (M7) ──────────
+
+def test_chroma_persists_across_reinit():
+    """Re-running init_vector_store() against the same persist_directory
+    should not need to re-embed from scratch, and must return identical
+    similarity results for a fixed query (persistence actually working)."""
+    import main
+    query = main.map_score_to_query(0.85)
+    before = main.vector_store.similarity_search_with_score(query, k=1)
+    init_vector_store()  # re-init against the same on-disk collection
+    after = main.vector_store.similarity_search_with_score(query, k=1)
+    assert before[0][0].metadata["label"] == after[0][0].metadata["label"]
+    assert before[0][1] == pytest.approx(after[0][1], abs=1e-6)
+
+def test_high_score_matches_signature_with_expected_confidence():
+    """Regression check: a clearly-high deepfake_score must still match a
+    signature and produce the same FAIL/confidence relationship the FAISS
+    baseline had (matched_signature present, confidence near the boosted
+    score per generate_verdict_via_llm's mock-LLM FAIL branch)."""
+    r = client.post("/audit",
+                    json={"stream_id": "regression_test", "frame_index": 1, "deepfake_score": 0.85},
+                    headers=HEADERS)
+    assert r.status_code == 200
+    d = r.json()
+    assert d["audit_verdict"] == "FAIL"
+    assert d["matched_signature"] is not None
+    assert d["confidence"] == pytest.approx(min(0.95, 0.85 + 0.05), abs=1e-6)

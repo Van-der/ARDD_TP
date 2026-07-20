@@ -22,6 +22,7 @@ Requirements (all in root requirements.txt):
 import argparse
 import base64
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -37,10 +38,11 @@ DATASET_ROOT = Path(__file__).parent / "datasets" / "ff++"
 REAL_DIR = DATASET_ROOT / "original_sequences" / "youtube" / "c23" / "videos"
 FAKE_DIR = DATASET_ROOT / "manipulated_sequences" / "Deepfakes" / "c23" / "videos"
 
-API_URL = "http://localhost:8003"
-WS_URL = "ws://localhost:8003/stream"
-KAFKA_BOOTSTRAP = "localhost:29092"  # external SASL_PLAINTEXT_HOST listener (host access)
+API_URL = "https://localhost:8003"
+WS_URL = "wss://localhost:8003/stream"
+KAFKA_BOOTSTRAP = "localhost:29092"  # external SASL_SSL_HOST listener (host access)
 KAFKA_TOPIC = "frames"
+CA_CERT = os.getenv("CA_CERT", str(Path(__file__).parent / "certs" / "ca.crt"))
 
 # ground-truth label encoded in the stream_id prefix
 REAL_PREFIX = "bench_real"
@@ -48,21 +50,26 @@ FAKE_PREFIX = "bench_fake"
 
 
 def _get_token() -> str:
+    # RBAC (M11): only the hardcoded admin/viewer pairs authenticate now —
+    # this script just reads WebSocket scores, so viewer is sufficient.
+    verify = CA_CERT if os.path.exists(CA_CERT) else True
     resp = requests.post(f"{API_URL}/auth/token",
-                         json={"client_id": "bench", "client_secret": "bench"},
-                         timeout=5)
+                         json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"},
+                         timeout=5, verify=verify)
     resp.raise_for_status()
     return resp.json()["access_token"]
 
 
 def _make_producer() -> KafkaProducer:
+    ssl_kwargs = {"ssl_cafile": CA_CERT} if os.path.exists(CA_CERT) else {}
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
-        security_protocol="SASL_PLAINTEXT",
+        security_protocol="SASL_SSL" if ssl_kwargs else "SASL_PLAINTEXT",
         sasl_mechanism="PLAIN",
         sasl_plain_username="admin",
         sasl_plain_password="admin-secret",
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        **ssl_kwargs,
     )
 
 
@@ -102,7 +109,7 @@ def _send_videos(videos: list[Path], stream_prefix: str,
                 "frame_index": sent,
                 "timestamp_ms": int(time.time() * 1000),
                 "payload": base64.b64encode(buf.tobytes()).decode(),
-            })
+            }, key=stream_id.encode("utf-8"))
             sent += 1
         cap.release()
         print(f"  [{stream_prefix}] {v.name} — {sent} frames")
@@ -168,8 +175,9 @@ def run_benchmark(n_videos: int, frames_per_video: int, pipeline_drain_s: float)
     drain_thread.start()
 
     print("Sending frames and collecting WebSocket scores …  (Ctrl-C to abort)\n")
+    sslopt = {"ca_certs": CA_CERT} if os.path.exists(CA_CERT) else None
     try:
-        ws_app.run_forever()
+        ws_app.run_forever(sslopt=sslopt)
     except KeyboardInterrupt:
         ws_app.close()
 

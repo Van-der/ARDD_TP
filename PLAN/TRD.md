@@ -11,8 +11,8 @@
 | Ingest Gateway | Python (OpenCV, FFmpeg) |
 | **Speed Layer** — Vision Service | PyTorch, FastAPI (EfficientNet-B4 + FFT dual-branch) |
 | **Batch Layer** — Temporal Service | PyTorch (ResNext50+LSTM — `Naman712/Deep-fake-detection`), `aiokafka`, FastAPI |
-| Frame Buffer (Batch Layer) | In-memory `deque(maxlen=20)` per stream; Redis in Phase 3 |
-| RAG / Context Service | LangChain, FAISS/ChromaDB, Ollama/Mistral |
+| Frame Buffer (Batch Layer) | Redis List per stream + atomic Lua push/flush (M4, replaced the original in-memory `deque(maxlen=20)`) |
+| RAG / Context Service | LangChain, ChromaDB (persistent, M7 — replaced the original in-memory FAISS), Ollama/Mistral |
 | Aggregation Service | Python, FastAPI |
 | MLOps & Telemetry | MLflow |
 | Frontend | React, TypeScript, Zustand, WebSockets |
@@ -165,11 +165,11 @@ Key current-phase behaviours:
 
 ## 6. Future States
 
-> Items below are **not** part of the v1.0.0 implementation. See `ROADMAP.md` for phasing.
+> Status below reflects the Phase 3-5 completion pass in `PLAN/PHASES.md` (M0-M13 done as of 2026-07-11; see that file for milestone-by-milestone detail). Items still genuinely pending are marked as such.
 
-- **Temporal Batch Service (Phase 2):** ResNext50+LSTM on 20-frame tumbling windows (~0.67s cycle). *In progress.*
-- **gRPC transport (Phase 3):** Replace REST between Kafka Consumer ↔ Vision Service to reduce serialization overhead.
-- **Horizontal Vision scaling (Phase 3):** Multiple Vision Service replicas behind a load balancer.
-- **ChromaDB persistent store (Phase 3):** Replace in-memory FAISS with persistent ChromaDB.
-- **Apache Flink aggregation (Phase 4):** Windowed stream processing and temporal analysis.
-- **Automated retraining pipeline (Phase 4):** Auto-trigger fine-tuning on drift detection.
+- **Temporal Batch Service:** ✅ Done. ResNext50+LSTM on 20-frame tumbling windows (~0.67s cycle).
+- **gRPC transport:** Evaluated and declined (M0/M1) — profiling showed REST/serialization overhead was only ~7-10ms of the round trip; RAG's LLM call dominated instead. See `PLAN/PROFILING.md`.
+- **Horizontal Vision scaling:** ✅ Done as a mechanism demo (M6) — replicas behind Compose's embedded DNS round-robin, sharing one GPU; proves LB/health-check routing, not real throughput gain.
+- **ChromaDB persistent store:** ✅ Done (M7) — replaced in-memory FAISS.
+- **Apache Flink aggregation:** Scoped down (M16) — the actual windowing needs are simple per-key rolling state already served by Redis-backed buffers; a full PyFlink migration isn't proportionate here (see `PLAN/PHASES.md` M16).
+- **Automated retraining pipeline:** Scoped down to atomic weight swap + rollback between two pre-existing checkpoint sets (M14, pending) — no real labeled retraining data source exists yet to drive live fine-tuning.

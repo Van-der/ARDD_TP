@@ -1,6 +1,8 @@
 import os
 import re
+import ssl
 import time
+import uuid
 import json
 import asyncio
 import logging
@@ -15,8 +17,23 @@ from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import base64
+import datetime
+import aiobreaker
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 import mlflow
+import redis.asyncio as aioredis
 from aiokafka import AIOKafkaConsumer
+from aiokafka.abc import ConsumerRebalanceListener
+from aiokafka.coordinator.assignors.sticky.sticky_assignor import StickyPartitionAssignor
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,27 +42,123 @@ START_TIME = time.time()
 # Config
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
 JWT_SECRET = os.getenv("JWT_SECRET", "ardd-tp-dev-secret-key-change-me!")
-VISION_URL = os.getenv("VISION_URL", "http://vision-service:8001/infer")
-RAG_URL = os.getenv("RAG_URL", "http://rag-agent:8002/audit")
+# RBAC (M11) — hardcoded role pairs, not a persistent user store (decision #7).
+ADMIN_CLIENT_ID = os.getenv("ADMIN_CLIENT_ID", "admin")
+ADMIN_CLIENT_SECRET = os.getenv("ADMIN_CLIENT_SECRET", "admin-secret-change-me")
+VIEWER_CLIENT_ID = os.getenv("VIEWER_CLIENT_ID", "viewer")
+VIEWER_CLIENT_SECRET = os.getenv("VIEWER_CLIENT_SECRET", "viewer-secret-change-me")
+VISION_URL = os.getenv("VISION_URL", "https://vision-service:8001/infer")
+RAG_URL = os.getenv("RAG_URL", "https://rag-agent:8002/audit")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
 KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
 KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
+CA_CERT = os.getenv("CA_CERT", "/certs/ca.crt")
+# mTLS (M10): vision-service/rag-agent/temporal-service require a client cert
+# (CERT_REQUIRED) on inbound connections — aggregation-service presents its
+# own server cert as its client identity for those outbound calls too.
+CLIENT_CERT_FILE = os.getenv("CLIENT_CERT_FILE", "/certs/aggregation-service.crt")
+CLIENT_KEY_FILE = os.getenv("CLIENT_KEY_FILE", "/certs/aggregation-service.key")
+
+
+def _client_cert():
+    if os.path.exists(CLIENT_CERT_FILE) and os.path.exists(CLIENT_KEY_FILE):
+        return (CLIENT_CERT_FILE, CLIENT_KEY_FILE)
+    return None
+try:
+    WEBHOOK_TARGETS: List[dict] = json.loads(os.getenv("WEBHOOK_TARGETS", "[]"))
+    if not isinstance(WEBHOOK_TARGETS, list):
+        raise ValueError("WEBHOOK_TARGETS must be a JSON array")
+except (json.JSONDecodeError, ValueError) as e:
+    logger.warning(f"WEBHOOK_TARGETS is not valid JSON — no webhook targets configured: {e}")
+    WEBHOOK_TARGETS = []
 RAG_TIMEOUT = float(os.getenv("RAG_TIMEOUT", "15.0"))  # seconds; tinyllama needs ~2-5s
 ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "0.90"))
 ALERT_WINDOW = int(os.getenv("ALERT_WINDOW", "5"))
+PROFILE = os.getenv("PROFILE", "false").lower() == "true"
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_KEY_TTL_S = 3600  # 1h of inactivity clears Redis-backed counters/history
+# Stream segment archival (M12) — local MinIO, S3-compatible, instead of real S3.
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "ardd-segments")
+
+_minio = boto3.client(
+    "s3",
+    endpoint_url=MINIO_ENDPOINT,
+    aws_access_key_id=MINIO_ACCESS_KEY,
+    aws_secret_access_key=MINIO_SECRET_KEY,
+    # boto3's default connect_timeout is ~60s — far too slow for a
+    # fire-and-forget path that must never meaningfully block anything.
+    # Short timeout + no retries so a down/unreachable MinIO fails fast.
+    config=BotoConfig(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}),
+)
+_minio_bucket_ready = False
+
+
+def _ensure_minio_bucket() -> None:
+    """Idempotent — create the bucket on first use if it doesn't exist yet.
+    Runs synchronously (called via asyncio.to_thread, boto3 has no async API)."""
+    global _minio_bucket_ready
+    if _minio_bucket_ready:
+        return
+    try:
+        _minio.head_bucket(Bucket=MINIO_BUCKET)
+    except ClientError:
+        _minio.create_bucket(Bucket=MINIO_BUCKET)
+    _minio_bucket_ready = True
+
+
+def _upload_segment_sync(stream_id: str, frame_index: int, raw_bytes: bytes) -> None:
+    _ensure_minio_bucket()
+    key = f"{stream_id}/frame_{frame_index}.jpg"
+    _minio.put_object(Bucket=MINIO_BUCKET, Key=key, Body=raw_bytes, ContentType="image/jpeg")
+
+
+async def _archive_segment(stream_id: str, frame_index: int, payload_b64: str) -> None:
+    """Fire-and-forget (asyncio.create_task, matching the webhook delivery
+    pattern) — archival failure must never block the frame pipeline."""
+    try:
+        raw_bytes = base64.b64decode(payload_b64)
+        await asyncio.to_thread(_upload_segment_sync, stream_id, frame_index, raw_bytes)
+        logger.info(f"Archived alert-streak-start segment: {stream_id}/frame_{frame_index}.jpg")
+    except Exception as e:
+        logger.warning(f"MinIO archival failed for {stream_id}/frame_{frame_index}: {e}")
+
+
+# Circuit breakers on the Vision/RAG calls: an open breaker fails fast instead
+# of waiting out the full httpx timeout (5s vision / RAG_TIMEOUT for rag) on
+# every frame during a partial outage. Using aiobreaker (not pybreaker) —
+# pybreaker's call_async requires an undeclared `tornado` dependency and
+# raises NameError without it; aiobreaker is asyncio-native with no extra deps.
+_vision_breaker = aiobreaker.CircuitBreaker(
+    fail_max=int(os.getenv("VISION_BREAKER_FAIL_MAX", "5")),
+    timeout_duration=datetime.timedelta(seconds=int(os.getenv("VISION_BREAKER_RESET_S", "30"))),
+    name="vision",
+)
+_rag_breaker = aiobreaker.CircuitBreaker(
+    fail_max=int(os.getenv("RAG_BREAKER_FAIL_MAX", "5")),
+    timeout_duration=datetime.timedelta(seconds=int(os.getenv("RAG_BREAKER_RESET_S", "30"))),
+    name="rag",
+)
 
 def _kafka_sasl_kwargs() -> dict:
-    return {
-        "security_protocol": "SASL_PLAINTEXT",
+    kwargs = {
+        "security_protocol": KAFKA_SECURITY_PROTOCOL,
         "sasl_mechanism": "PLAIN",
         "sasl_plain_username": KAFKA_SASL_USERNAME or "admin",
         "sasl_plain_password": KAFKA_SASL_PASSWORD or "admin-secret",
         "api_version": "auto",
     }
+    if kwargs["security_protocol"] == "SASL_SSL":
+        if os.path.exists(CA_CERT):
+            kwargs["ssl_context"] = ssl.create_default_context(cafile=CA_CERT)
+        else:
+            logger.warning(f"CA_CERT '{CA_CERT}' not found — falling back to SASL_PLAINTEXT")
+            kwargs["security_protocol"] = "SASL_PLAINTEXT"
+    return kwargs
 
 # Setup MLflow — one named parent run per service startup
 _mlflow_run_id: Optional[str] = None
@@ -79,6 +192,14 @@ _MAX_PAYLOAD_B64_BYTES = 2_796_032
 _AUTH_RATE_LIMIT = 20
 _AUTH_RATE_WINDOW = 60  # seconds
 _auth_attempts: Dict[str, list] = {}
+
+# JWT refresh/revocation (SEC-4): short-lived access tokens + a longer-lived
+# refresh token, with an in-memory revocation set (matches the rate-limiter's
+# own in-memory-state pattern above — not persisted across restarts, same as
+# every other in-process cache in this service).
+ACCESS_TOKEN_TTL = int(os.getenv("ACCESS_TOKEN_TTL", "900"))       # 15 min
+REFRESH_TOKEN_TTL = int(os.getenv("REFRESH_TOKEN_TTL", "86400"))   # 24 h
+revoked_jtis: set = set()
 
 
 def _is_rate_limited(client_ip: str) -> bool:
@@ -121,6 +242,89 @@ def _evict_oldest(d: dict, cap: int) -> None:
         for k in to_drop:
             del d[k]
 
+# --- Redis-backed alert/drift state, with in-memory fallback ---
+# Redis makes alert_counters/drift_history durable across restarts and safe
+# to share across multiple aggregation-service replicas (M3's --scale
+# testing). If REDIS_URL is unset, or Redis is unreachable, every helper
+# below transparently falls back to the in-memory dicts above — Redis is
+# never a hard dependency. Note: switching between Redis and the in-memory
+# fallback mid-run does not reconcile state between the two; this is an
+# accepted limitation for a fallback mechanism, not a distributed-state
+# guarantee.
+_redis: Optional["aioredis.Redis"] = None
+_redis_was_available = False
+
+async def _redis_client() -> Optional["aioredis.Redis"]:
+    global _redis, _redis_was_available
+    if not REDIS_URL:
+        return None
+    if _redis is None:
+        _redis = aioredis.from_url(
+            REDIS_URL, decode_responses=True,
+            socket_connect_timeout=1, socket_timeout=1,
+        )
+    try:
+        await _redis.ping()
+        _redis_was_available = True
+        return _redis
+    except Exception:
+        if _redis_was_available:
+            logger.warning("Redis unavailable — falling back to in-memory alert/drift state.")
+        _redis_was_available = False
+        return None
+
+async def _incr_alert_counter(stream_id: str) -> int:
+    r = await _redis_client()
+    if r is not None:
+        try:
+            key = f"alert_ctr:{stream_id}"
+            val = await r.incr(key)
+            await r.expire(key, REDIS_KEY_TTL_S)
+            return val
+        except Exception:
+            pass
+    alert_counters[stream_id] += 1
+    _evict_oldest(alert_counters, MAX_STREAMS)
+    return alert_counters[stream_id]
+
+async def _reset_alert_counter(stream_id: str) -> None:
+    r = await _redis_client()
+    if r is not None:
+        try:
+            await r.set(f"alert_ctr:{stream_id}", 0, ex=REDIS_KEY_TTL_S)
+            return
+        except Exception:
+            pass
+    alert_counters[stream_id] = 0
+    _evict_oldest(alert_counters, MAX_STREAMS)
+
+async def _append_drift(stream_id: str, confidence: float) -> None:
+    r = await _redis_client()
+    if r is not None:
+        try:
+            key = f"drift:{stream_id}"
+            await r.lpush(key, confidence)
+            await r.ltrim(key, 0, 99)  # keep last 100 — matches deque(maxlen=100)
+            await r.expire(key, REDIS_KEY_TTL_S)
+            return
+        except Exception:
+            pass
+    drift_history[stream_id].append(confidence)
+    _evict_oldest(drift_history, MAX_STREAMS)
+
+async def _drift_stats(stream_id: str) -> tuple[int, float]:
+    """Returns (sample_count, avg_confidence) for the rolling drift window."""
+    r = await _redis_client()
+    if r is not None:
+        try:
+            vals = await r.lrange(f"drift:{stream_id}", 0, -1)
+            vals = [float(v) for v in vals]
+            return (len(vals), sum(vals) / len(vals)) if vals else (0, 0.0)
+        except Exception:
+            pass
+    history = drift_history[stream_id]
+    return (len(history), sum(history) / len(history)) if history else (0, 0.0)
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -148,6 +352,9 @@ class FramePayload(BaseModel):
 class TokenRequest(BaseModel):
     client_id: str
     client_secret: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 class AggregatedResult(BaseModel):
     stream_id: str
@@ -202,8 +409,9 @@ async def lifespan(app: FastAPI):
             logger.warning("SECURITY WARNING: default Kafka SASL password detected — set KAFKA_SASL_USERNAME/PASSWORD before production deployment.")
         if JWT_SECRET == "ardd-tp-dev-secret-key-change-me!":
             logger.warning("SECURITY WARNING: default JWT_SECRET detected — set a strong secret before production deployment.")
-        if WEBHOOK_URL and not _valid_webhook_url(WEBHOOK_URL):
-            logger.warning(f"SECURITY WARNING: WEBHOOK_URL '{WEBHOOK_URL}' is not a valid HTTP(S) URL — webhook delivery will be blocked.")
+        for _t in WEBHOOK_TARGETS:
+            if not _valid_webhook_url(_t.get("url", "")):
+                logger.warning(f"SECURITY WARNING: webhook target '{_t.get('url')}' is not a valid HTTP(S) URL — delivery to it will be blocked.")
     asyncio.create_task(mlflow_flush_task())
     asyncio.create_task(start_labels_consumer())
     asyncio.create_task(start_frames_consumer())
@@ -218,11 +426,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def process_labeled_result(result: dict, label: str):
+# OpenTelemetry tracing (M8) — local Jaeger via otel-collector, no cloud APM.
+_otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+if _otel_endpoint:
+    _provider = TracerProvider(resource=Resource.create({"service.name": "aggregation-service"}))
+    _provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=_otel_endpoint, insecure=True)))
+    trace.set_tracer_provider(_provider)
+    FastAPIInstrumentor.instrument_app(app)
+tracer = trace.get_tracer(__name__)
+
+async def process_labeled_result(result: dict, label: str):
     if label == "REAL":
         stream_id = result["stream_id"]
         confidence = 1.0 - result["deepfake_score"]
-        drift_history[stream_id].append(confidence)  # deque(maxlen=100) auto-trims
+        await _append_drift(stream_id, confidence)
+
+class RebalanceLogger(ConsumerRebalanceListener):
+    """Logs partition revoke/assign events during a consumer-group rebalance.
+
+    Note: aiokafka's rebalance protocol is always "eager" (stop-the-world) —
+    unlike the Java client, it has no incremental/cooperative rebalance
+    protocol to opt into. StickyPartitionAssignor (passed as
+    partition_assignment_strategy below) minimizes partition churn across
+    rebalances, which is the best available mitigation in aiokafka; this
+    listener adds visibility into when a rebalance starts/ends rather than a
+    hard pause-and-drain guarantee (offsets still auto-commit on the default
+    5s interval regardless of in-flight per-frame tasks).
+    """
+    def __init__(self, name: str):
+        self.name = name
+
+    async def on_partitions_revoked(self, revoked):
+        if revoked:
+            logger.warning(f"[{self.name}] Rebalance: partitions revoked: {sorted(revoked)}")
+
+    async def on_partitions_assigned(self, assigned):
+        if assigned:
+            logger.info(f"[{self.name}] Rebalance: partitions assigned: {sorted(assigned)}")
 
 async def start_labels_consumer():
     if os.getenv("TESTING"):
@@ -230,12 +470,14 @@ async def start_labels_consumer():
     while True:
         try:
             consumer = AIOKafkaConsumer(
-                os.getenv("KAFKA_TOPIC_LABELS", "labels"),
                 bootstrap_servers=KAFKA_BOOTSTRAP,
                 group_id="aggregation-labels-group",
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                partition_assignment_strategy=(StickyPartitionAssignor,),
                 **_kafka_sasl_kwargs()
             )
+            consumer.subscribe(topics=[os.getenv("KAFKA_TOPIC_LABELS", "labels")],
+                               listener=RebalanceLogger("aggregation-labels-group"))
             await consumer.start()
             logger.info("Labels consumer started.")
             try:
@@ -249,7 +491,7 @@ async def start_labels_consumer():
                     key = f"{stream_id}_{frame_index}"
                     if key in results_buffer:
                         result = results_buffer.pop(key)
-                        process_labeled_result(result, label)
+                        await process_labeled_result(result, label)
                     else:
                         labels_buffer[key] = label_data
                         if len(labels_buffer) > MAX_LABELS_BUFFER:
@@ -261,25 +503,39 @@ async def start_labels_consumer():
             logger.error(f"Labels consumer crashed: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
 
+_stream_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+async def _process_frame_locked(payload: FramePayload) -> None:
+    """Serialize processing per stream_id (preserves alert/drift ordering) while
+    letting different streams run concurrently — a single slow RAG/LLM call for
+    one stream must not stall every other stream's frames behind it."""
+    try:
+        async with _stream_locks[payload.stream_id]:
+            await process_frame_payload(payload)
+    except Exception as e:
+        logger.error(f"Pipeline error processing frame: {e}")
+
 async def start_frames_consumer():
     if os.getenv("TESTING"):
         return
     while True:
         try:
             consumer = AIOKafkaConsumer(
-                "frames",
                 bootstrap_servers=KAFKA_BOOTSTRAP,
                 group_id="aggregation-pipeline-group",
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                partition_assignment_strategy=(StickyPartitionAssignor,),
                 **_kafka_sasl_kwargs()
             )
+            consumer.subscribe(topics=["frames"],
+                               listener=RebalanceLogger("aggregation-pipeline-group"))
             await consumer.start()
             logger.info("Frames consumer started.")
             try:
                 async for msg in consumer:
                     try:
                         payload = FramePayload(**msg.value)
-                        await process_frame_payload(payload)
+                        asyncio.create_task(_process_frame_locked(payload))
                     except Exception as e:
                         logger.error(f"Pipeline error processing frame: {e}")
             finally:
@@ -317,15 +573,98 @@ async def verify_api_key(request: Request):
         raise HTTPException(status_code=401, detail="Missing or invalid API key")
     return api_key
 
+def _role_for_credentials(client_id: str, client_secret: str) -> Optional[str]:
+    """RBAC (M11): hardcoded admin/viewer role pairs, not a persistent user store."""
+    if client_id == ADMIN_CLIENT_ID and client_secret == ADMIN_CLIENT_SECRET:
+        return "admin"
+    if client_id == VIEWER_CLIENT_ID and client_secret == VIEWER_CLIENT_SECRET:
+        return "viewer"
+    return None
+
+
+def _issue_tokens(client_id: str, role: str) -> dict:
+    """Issue a short-lived access token + longer-lived refresh token (SEC-4),
+    each with its own `jti` so either can be individually revoked."""
+    now = time.time()
+    access_token = jwt.encode(
+        {"sub": client_id, "role": role, "type": "access", "jti": str(uuid.uuid4()), "exp": now + ACCESS_TOKEN_TTL},
+        JWT_SECRET, algorithm="HS256",
+    )
+    refresh_token = jwt.encode(
+        {"sub": client_id, "role": role, "type": "refresh", "jti": str(uuid.uuid4()), "exp": now + REFRESH_TOKEN_TTL},
+        JWT_SECRET, algorithm="HS256",
+    )
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer", "expires_in": ACCESS_TOKEN_TTL}
+
+
 @app.post("/auth/token")
 async def login(req: TokenRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     if _is_rate_limited(client_ip):
         raise HTTPException(status_code=429, detail="Too many auth requests — try again later.")
-    if not req.client_id or not req.client_secret:
+    role = _role_for_credentials(req.client_id, req.client_secret)
+    if role is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = jwt.encode({"sub": req.client_id, "exp": time.time() + 3600}, JWT_SECRET, algorithm="HS256")
-    return {"access_token": token, "expires_in": 3600}
+    return _issue_tokens(req.client_id, role)
+
+
+@app.post("/auth/refresh")
+async def refresh(req: RefreshRequest):
+    """Exchange a valid, unrevoked refresh token for a new access/refresh
+    pair. The used refresh token is revoked (rotation) so it can't be replayed."""
+    try:
+        payload = jwt.decode(req.refresh_token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Not a refresh token")
+    if payload.get("jti") in revoked_jtis:
+        raise HTTPException(status_code=401, detail="Refresh token revoked")
+    revoked_jtis.add(payload["jti"])
+    return _issue_tokens(payload["sub"], payload["role"])
+
+
+@app.post("/auth/revoke")
+async def revoke(request: Request):
+    """Self-service revocation of the caller's own bearer token (e.g. on
+    logout) — adds its `jti` to the in-memory revocation set checked by
+    require_role() and the WebSocket handshake below."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = auth_header[len("Bearer "):]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if "jti" in payload:
+        revoked_jtis.add(payload["jti"])
+    return {"revoked": True}
+
+
+def require_role(role: str):
+    """FastAPI dependency factory gating an endpoint to a JWT role claim.
+    401 if the bearer token is missing/invalid/expired/revoked (not authenticated);
+    403 if it's valid but the wrong role (authenticated, not authorized)."""
+    async def _check(request: Request) -> dict:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing bearer token")
+        token = auth_header[len("Bearer "):]
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token expired")
+        except jwt.InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        if payload.get("jti") in revoked_jtis:
+            raise HTTPException(status_code=401, detail="Token revoked")
+        if payload.get("role") != role:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        return payload
+    return _check
 
 @app.websocket("/stream")
 async def websocket_endpoint(websocket: WebSocket):
@@ -335,11 +674,14 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        _ws_payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
         await websocket.close(code=1008)
         return
     except jwt.InvalidTokenError:
+        await websocket.close(code=1008)
+        return
+    if _ws_payload.get("jti") in revoked_jtis:
         await websocket.close(code=1008)
         return
 
@@ -352,22 +694,46 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 async def call_vision(payload: dict) -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(VISION_URL, json=payload, headers={"X-API-Key": INTERNAL_API_KEY}, timeout=5.0)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Vision Service Error")
-        return resp.json()
+    async def _do_call() -> dict:
+        with tracer.start_as_current_span("call_vision"):
+            t0 = time.perf_counter()
+            async with httpx.AsyncClient(verify=CA_CERT if os.path.exists(CA_CERT) else True, cert=_client_cert()) as client:
+                resp = await client.post(VISION_URL, json=payload, headers={"X-API-Key": INTERNAL_API_KEY}, timeout=5.0)
+                round_trip_ms = (time.perf_counter() - t0) * 1000
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=502, detail="Vision Service Error")
+                result = resp.json()
+                if PROFILE:
+                    server_latency_ms = result.get("latency_ms", 0)
+                    logger.info(
+                        "PROFILE vision stream=%s frame=%s round_trip_ms=%.1f server_latency_ms=%d overhead_ms=%.1f",
+                        payload.get("stream_id"), payload.get("frame_index"),
+                        round_trip_ms, server_latency_ms, round_trip_ms - server_latency_ms,
+                    )
+                return result
+    return await _vision_breaker.call_async(_do_call)
 
 async def call_rag(stream_id: str, frame_index: int, score: float) -> dict:
-    req = {
-        "stream_id": stream_id,
-        "frame_index": frame_index,
-        "deepfake_score": score
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(RAG_URL, json=req, headers={"X-API-Key": INTERNAL_API_KEY}, timeout=RAG_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+    async def _do_call() -> dict:
+        with tracer.start_as_current_span("call_rag"):
+            req = {
+                "stream_id": stream_id,
+                "frame_index": frame_index,
+                "deepfake_score": score
+            }
+            t0 = time.perf_counter()
+            async with httpx.AsyncClient(verify=CA_CERT if os.path.exists(CA_CERT) else True, cert=_client_cert()) as client:
+                resp = await client.post(RAG_URL, json=req, headers={"X-API-Key": INTERNAL_API_KEY}, timeout=RAG_TIMEOUT)
+                resp.raise_for_status()
+                result = resp.json()
+                if PROFILE:
+                    round_trip_ms = (time.perf_counter() - t0) * 1000
+                    logger.info(
+                        "PROFILE rag stream=%s frame=%s round_trip_ms=%.1f",
+                        stream_id, frame_index, round_trip_ms,
+                    )
+                return result
+    return await _rag_breaker.call_async(_do_call)
 
 async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     # Security: validate stream_id format (prevents log injection + unbounded dict growth)
@@ -414,20 +780,23 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     final_score = min(max(final_score, 0.0), 1.0)
     
     if final_score > ALERT_THRESHOLD:
-        alert_counters[payload.stream_id] += 1
+        consecutive_alerts = await _incr_alert_counter(payload.stream_id)
     else:
-        alert_counters[payload.stream_id] = 0
-    _evict_oldest(alert_counters, MAX_STREAMS)
+        await _reset_alert_counter(payload.stream_id)
+        consecutive_alerts = 0
 
-    alert = alert_counters[payload.stream_id] >= ALERT_WINDOW
+    alert = consecutive_alerts >= ALERT_WINDOW
+
+    # Stream segment archival (M12): fires exactly once per alert streak, on
+    # the frame that crosses the threshold — not on every subsequent alerted
+    # frame, and not again until the streak resets and re-triggers.
+    if consecutive_alerts == ALERT_WINDOW:
+        asyncio.create_task(_archive_segment(payload.stream_id, payload.frame_index, payload.payload))
 
     drift_flag = False
-    history = drift_history[payload.stream_id]
-    _evict_oldest(drift_history, MAX_STREAMS)
-    if len(history) >= 100:  # rolling: evaluate continuously once window is full
-        avg_confidence = sum(history) / len(history)
-        if avg_confidence < 0.60:
-            drift_flag = True
+    sample_count, avg_confidence = await _drift_stats(payload.stream_id)
+    if sample_count >= 100 and avg_confidence < 0.60:  # rolling: evaluate continuously once window is full
+        drift_flag = True
 
     latency_ms = int((time.time() - start_time) * 1000)
     
@@ -467,7 +836,7 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     
     if key in labels_buffer:
         label_data = labels_buffer.pop(key)
-        process_labeled_result(result_data, label_data["label"])
+        await process_labeled_result(result_data, label_data["label"])
     else:
         results_buffer[key] = result_data
         if len(results_buffer) > MAX_LABELS_BUFFER:
@@ -486,8 +855,9 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
     }
     await manager.broadcast(json.dumps(ws_event))
 
-    # Webhook alert delivery (3 attempts with backoff) — SCHEMA.md §8
-    if alert and WEBHOOK_URL:
+    # Webhook alert delivery (3 attempts with backoff, fanned out to all
+    # configured targets) — SCHEMA.md §8
+    if alert and WEBHOOK_TARGETS:
         webhook_payload = {
             "event": "DEEPFAKE_ALERT",
             "stream_id": payload.stream_id,
@@ -495,33 +865,61 @@ async def process_frame_payload(payload: FramePayload) -> AggregatedResult:
             "final_score": final_score,
             "audit_verdict": audit_verdict,
             "matched_signature": matched_signature,
-            "consecutive_alert_frames": alert_counters[payload.stream_id],
+            "consecutive_alert_frames": consecutive_alerts,
             "timestamp_ms": payload.timestamp_ms
         }
-        asyncio.create_task(_deliver_webhook(webhook_payload))
+        asyncio.create_task(_deliver_webhook_fanout(webhook_payload))
 
     return result
 
 
-async def _deliver_webhook(payload: dict, max_attempts: int = 3) -> None:
-    """Deliver webhook alert with 3-attempt exponential backoff."""
+def _format_for_target(payload: dict, fmt: str) -> dict:
+    """Reshape the alert payload for a target's expected webhook schema."""
+    if fmt == "slack":
+        return {
+            "text": (
+                f":rotating_light: *DEEPFAKE_ALERT* on stream `{payload['stream_id']}` "
+                f"(frame {payload['frame_index']})\n"
+                f"score={payload['final_score']:.2f} verdict={payload['audit_verdict']} "
+                f"signature={payload['matched_signature']} "
+                f"consecutive_frames={payload['consecutive_alert_frames']}"
+            )
+        }
+    return payload
+
+
+async def _deliver_webhook_fanout(payload: dict) -> None:
+    """Fan out webhook delivery to every configured target; one bad target
+    (invalid URL, unreachable, non-2xx) must not block or cancel the others."""
+    await asyncio.gather(
+        *(_deliver_webhook(target, payload) for target in WEBHOOK_TARGETS),
+        return_exceptions=True,
+    )
+
+
+async def _deliver_webhook(target: dict, payload: dict, max_attempts: int = 3) -> None:
+    """Deliver one webhook alert to one target with 3-attempt exponential backoff."""
+    url = target.get("url", "")
+    token = target.get("token", "")
+    fmt = target.get("format", "generic")
     # Security: SSRF guard — only deliver to validated HTTP(S) URLs
-    if not _valid_webhook_url(WEBHOOK_URL):
-        logger.error("Webhook delivery blocked: WEBHOOK_URL is not a valid HTTP(S) URL")
+    if not _valid_webhook_url(url):
+        logger.error(f"Webhook delivery blocked: target URL '{url}' is not a valid HTTP(S) URL")
         return
+    body = _format_for_target(payload, fmt)
     for attempt in range(1, max_attempts + 1):
         try:
             async with httpx.AsyncClient() as client:
-                headers = {"Authorization": f"Bearer {WEBHOOK_TOKEN}"} if WEBHOOK_TOKEN else {}
-                resp = await client.post(WEBHOOK_URL, json=payload, headers=headers, timeout=5.0)
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                resp = await client.post(url, json=body, headers=headers, timeout=5.0)
                 resp.raise_for_status()
-                logger.info(f"Webhook delivered on attempt {attempt}")
+                logger.info(f"Webhook delivered to {url} on attempt {attempt}")
                 return
         except Exception as e:
-            logger.warning(f"Webhook delivery attempt {attempt}/{max_attempts} failed: {e}")
+            logger.warning(f"Webhook delivery to {url} attempt {attempt}/{max_attempts} failed: {e}")
             if attempt < max_attempts:
                 await asyncio.sleep(0.5 * (2 ** attempt))
-    logger.error("Webhook delivery failed after 3 attempts")
+    logger.error(f"Webhook delivery to {url} failed after {max_attempts} attempts")
 
 @app.post("/temporal_audit", dependencies=[Depends(verify_api_key)])
 async def temporal_audit(payload: TemporalAuditResult):
@@ -551,20 +949,42 @@ async def temporal_audit(payload: TemporalAuditResult):
 async def aggregate(payload: FramePayload):
     return await process_frame_payload(payload)
 
+
+class ResetBreakerRequest(BaseModel):
+    target: str  # "vision" | "rag" | "both"
+
+
+@app.post("/admin/reset_breaker", dependencies=[Depends(require_role("admin"))])
+async def reset_breaker(req: ResetBreakerRequest):
+    """Admin-only (M11): manually close an open circuit breaker instead of
+    waiting out VISION_BREAKER_RESET_S/RAG_BREAKER_RESET_S."""
+    if req.target not in ("vision", "rag", "both"):
+        raise HTTPException(status_code=422, detail="target must be 'vision', 'rag', or 'both'")
+    reset = []
+    if req.target in ("vision", "both"):
+        _vision_breaker.close()
+        reset.append("vision")
+    if req.target in ("rag", "both"):
+        _rag_breaker.close()
+        reset.append("rag")
+    return {"status": "ok", "reset": reset}
+
 @app.get("/health")
 async def health():
     temporal_status = "unavailable"
     if not os.getenv("TESTING"):
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get("http://temporal-service:8004/health", timeout=2.0)
+            async with httpx.AsyncClient(verify=CA_CERT if os.path.exists(CA_CERT) else True, cert=_client_cert()) as client:
+                resp = await client.get("https://temporal-service:8004/health", timeout=2.0)
                 if resp.status_code == 200:
                     temporal_status = "ok"
         except Exception:
             pass
     return {
-        "status": "ok", 
-        "service": "aggregation-service", 
+        "status": "ok",
+        "service": "aggregation-service",
         "uptime_s": int(time.time() - START_TIME),
-        "temporal_service_status": temporal_status
+        "temporal_service_status": temporal_status,
+        "vision_circuit_state": _vision_breaker.current_state.name.lower(),
+        "rag_circuit_state": _rag_breaker.current_state.name.lower(),
     }

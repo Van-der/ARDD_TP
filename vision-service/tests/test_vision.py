@@ -37,6 +37,12 @@ def test_health():
     assert r.json()["status"] == "ok"
     assert r.json()["service"] == "vision-service"
 
+def test_health_reports_calibration_trained_flag():
+    """calibration_trained matches spatial_trained/fft_mlp_trained/fusion_trained's pattern (M13)."""
+    d = client.get("/health").json()
+    assert "calibration_trained" in d
+    assert isinstance(d["calibration_trained"], bool)
+
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 
@@ -136,6 +142,41 @@ def test_score_combination_boundary_zero():
 def test_score_combination_boundary_one():
     expected = 0.6 * 1.0 + 0.4 * 1.0
     assert expected == 1.0
+
+
+# ── Unit: confidence calibration (M13) ─────────────────────────────────────
+
+def test_calibrate_passthrough_when_no_calibrator(monkeypatch):
+    """No calibrator loaded (the default on host, where CALIBRATION_PATH
+    doesn't exist) → calibrate() is a no-op."""
+    import main
+    monkeypatch.setattr(main, "calibrator", None)
+    assert main.calibrate(0.42) == 0.42
+
+def test_calibrate_applies_isotonic_mapping(monkeypatch):
+    """When a calibrator is loaded, calibrate() actually uses it."""
+    import main
+    from sklearn.isotonic import IsotonicRegression
+    cal = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    cal.fit([0.0, 0.5, 1.0], [0.0, 0.2, 1.0])  # deliberately non-identity mapping
+    monkeypatch.setattr(main, "calibrator", cal)
+    assert main.calibrate(0.5) != 0.5
+    assert abs(main.calibrate(0.5) - 0.2) < 0.05
+
+def test_calibrate_monotonic_in_raw_score(monkeypatch):
+    """Calibration must not change score rank order — a non-monotonic
+    calibrator would be a bug in fit_calibration.py, not in this function,
+    but this test protects the invariant regardless of what's loaded."""
+    import main
+    from sklearn.isotonic import IsotonicRegression
+    np_scores = [0.1, 0.3, 0.5, 0.6, 0.8, 0.95]
+    np_labels = [0, 0, 1, 0, 1, 1]
+    cal = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    cal.fit(np_scores, np_labels)
+    monkeypatch.setattr(main, "calibrator", cal)
+    probe = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    calibrated = [main.calibrate(s) for s in probe]
+    assert calibrated == sorted(calibrated), "calibrate() must preserve rank order"
 
 
 # ── Unit: alignment failure (TESTING.md §2) ────────────────────────────────

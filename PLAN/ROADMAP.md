@@ -84,19 +84,19 @@ The system evolves from a simple sequential pipeline to a **split-stream Lambda 
 
 ---
 
-## Phase 2.5 — Speed Layer Training ⬜ In Progress
+## Phase 2.5 — Speed Layer Training ✅ Done
 
 Replaces the ImageNet-pretrained EfficientNet-B4 + heuristic FFT branch with a fully trained dual-branch model on FaceForensics++ data.
 
 | Component | Status | Notes |
 |---|---|---|
-| Dataset | ⬜ Downloading | FF++ c23, 1000 real + 2000 fake; 50+50 test sample ready |
-| `vision-service/modeling.py` — `FftMlp` class | ⬜ Pending | 64→32→1 + Dropout(0.3) |
-| `extract_faces.py` | ⬜ Pending | MTCNN offline crop extraction, every 5th frame |
-| `train_vision.py` | ⬜ Pending | EfficientNet-B4 fine-tune + FFT MLP training |
-| `vision-service/main.py` — replace heuristic | ⬜ Pending | Load trained `FftMlp` + learned `alpha` fusion |
-| `docker-compose.yml` — GPU passthrough | ⬜ Pending | `nvidia-container-toolkit` already installed |
-| FF++ benchmark results | ⬜ Pending | `video_feeder.py --mode eval` on 140+140 test set |
+| Dataset | ✅ Done | FF++ c23, 1000 real + 2000 fake; 50+50 test sample ready |
+| `vision-service/modeling.py` — `FftMlp` class | ✅ Done | 64→32→1 + Dropout(0.3) |
+| `extract_faces.py` | ✅ Done | MTCNN offline crop extraction, every 5th frame |
+| `train_vision.py` | ✅ Done | EfficientNet-B4 fine-tune + FFT MLP training |
+| `vision-service/main.py` — replace heuristic | ✅ Done | Loads trained `FftMlp` + learned `alpha` fusion; M13 adds isotonic calibration on top |
+| `docker-compose.yml` — GPU passthrough | ✅ Done | `nvidia-container-toolkit`, `deploy.resources.reservations.devices` on vision-service |
+| FF++ benchmark results | ✅ Done | AUC 0.9987 pre-calibration; 0.99780→0.99791 post-calibration (M13) |
 
 **Design decisions locked 2026-06-17:** radial FFT bins (64-dim), logistic regression fusion (learned α), safe augmentation, official 720/140/140 split, every-5th-frame sampling, weighted loss `[2.0, 1.0]`, batch=16, EfficientNet LR=1e-4 + MLP LR=1e-3, cosine annealing, 10 epochs, state_dict save, no early stopping, MLP dropout(0.3).
 
@@ -108,7 +108,7 @@ Improvements to throughput and inter-service communication efficiency.
 
 | Item | Description |
 |---|---|
-| gRPC transport | Replace REST between Kafka Consumer ↔ Vision Service to reduce serialization overhead |
+| ~~gRPC transport~~ — evaluated, declined | Profiling (`PLAN/PROFILING.md`) showed REST/serialization overhead is only ~7-10ms (~7% of round trip); the real bottleneck under real LLM inference is RAG's tinyllama call (~1s median). gRPC migration would not meaningfully help — see M1 in the implementation plan for the revised scope (decouple RAG from the blocking per-frame path instead). |
 | Multi-topic ingestion | Expand beyond 3 Kafka topics for multi-stream support |
 | Vision Service horizontal scaling | Run multiple Vision Service replicas behind a load balancer |
 | ChromaDB persistent store | Replace in-memory FAISS with persistent ChromaDB for RAG knowledge base |
@@ -125,7 +125,7 @@ Temporal analysis and cross-stream intelligence.
 | Apache Flink aggregation | Migrate Aggregation Service logic to Flink for windowed stream processing |
 | Graph threat intelligence DB | Link recurring synthetic identities across independent streams |
 | Automated retraining pipeline | Trigger fine-tuning job automatically when drift flag is raised; push new weights to Vision Service without downtime |
-| Confidence calibration | Post-hoc calibration layer on Vision scores to reduce false-positive rate |
+| Confidence calibration ✅ | Isotonic regression on the fused score, fit against the same val split used for fusion — measured live: AUC unchanged (0.9978→0.9979), false-positive rate at the 0.90 alert threshold cut from 0.29% to 0.10% |
 
 ---
 
@@ -135,8 +135,8 @@ Production readiness and audit trail.
 
 | Item | Description |
 |---|---|
-| Stream segment archival | Persist flagged segments (score >0.90 for ≥5 frames) to object storage |
-| Webhook alert integrations | Connect threat escalation webhooks to Slack, PagerDuty, or SIEM |
-| Role-based dashboard access | Auth layer on React dashboard for compliance environments |
-| End-to-end latency audit | Instrument each hop with OpenTelemetry traces to validate 200ms SLA per frame |
-| mTLS | Certificate management and mutual TLS on all internal service links |
+| Stream segment archival ✅ | Local MinIO (S3-compatible, no real S3 account needed); one JPEG per alert streak (not every alerted frame) uploaded to `s3://ardd-segments/{stream_id}/frame_{frame_index}.jpg` |
+| Webhook alert integrations ✅ | Multi-target fan-out (`WEBHOOK_TARGETS` JSON array) to a local demo receiver (generic format) and/or a real Slack incoming webhook (`format: "slack"`) — no PagerDuty/SIEM account needed for a local college-project deployment |
+| Role-based dashboard access ✅ | Hardcoded admin/viewer role pairs baked into JWT claims (not a persistent user store); `require_role()` gates admin-only endpoints (403 vs 401); frontend hides admin UI client-side from the decoded role claim |
+| End-to-end latency audit ✅ | Local `otel-collector` + Jaeger (no cloud APM); per-hop spans on every service |
+| mTLS ✅ | Local self-signed CA (`scripts/gen_certs.sh`); full mTLS on Vision/RAG/Temporal, TLS-only (browser-facing) on Aggregation Service, SASL_SSL on Kafka; MLflow/Ollama/webhook targets excluded by design (no TLS support / third-party / arbitrary external endpoint) |

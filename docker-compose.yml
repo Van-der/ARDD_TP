@@ -23,23 +23,93 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9092,SASL_PLAINTEXT_HOST://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka:9092,SASL_PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_PLAINTEXT_HOST:SASL_PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+      # SASL_SSL (M10) = TLS transport + the existing SASL PLAIN username/
+      # password auth — not mTLS. A Kafka client cert would be redundant with
+      # SASL and isn't requested by any client below (ssl.client.auth left
+      # unset, defaults to "none"). Listener names avoid underscores
+      # ("INTERNAL"/"EXTERNAL") since Confluent's env-var mapping needs a
+      # fragile double-underscore escape for names that already contain one
+      # (see the old SASL__PLAINTEXT__HOST var this replaced).
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_SSL,EXTERNAL:SASL_SSL
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
       KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
-      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret" user_admin="admin-secret";'
-      KAFKA_LISTENER_NAME_SASL__PLAINTEXT__HOST_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret" user_admin="admin-secret";'
+      KAFKA_LISTENER_NAME_INTERNAL_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret" user_admin="admin-secret";'
+      KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret" user_admin="admin-secret";'
+      # PEM-format SSL (KIP-651) — no JKS/keytool needed; kafka-keystore.pem is
+      # kafka.crt + kafka.key concatenated by scripts/gen_certs.sh.
+      KAFKA_SSL_KEYSTORE_TYPE: PEM
+      KAFKA_SSL_KEYSTORE_LOCATION: /certs/kafka-keystore.pem
+      KAFKA_SSL_TRUSTSTORE_TYPE: PEM
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /certs/ca.crt
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_LOG_RETENTION_MS: 7200000
       KAFKA_LOG_RETENTION_BYTES: 536870912
+      KAFKA_NUM_PARTITIONS: 6
       KAFKA_OPTS: "-Ddummy=true"
+    volumes:
+      - ./certs:/certs:ro
     ports:
       - "9092:9092"
       - "29092:29092"
+    networks:
+      - ardd_net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks:
+      - ardd_net
+    restart: unless-stopped
+
+  # Local S3-compatible object storage (M12) — MinIO instead of real S3.
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "9002:9000"   # S3 API (9000 clashes with webhook-receiver's host port)
+      - "9001:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    networks:
+      - ardd_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Local tracing stack (M8) — no cloud APM. Services send OTLP traces to
+  # otel-collector, which forwards to Jaeger; view at http://localhost:16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+    networks:
+      - ardd_net
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.96.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otel-collector-config.yaml:ro
+    depends_on:
+      - jaeger
     networks:
       - ardd_net
     restart: unless-stopped
@@ -58,9 +128,11 @@ services:
       - RTSP_SOURCE=${RTSP_SOURCE:-rtsp://localhost:8554/stream}
       - FPS_TARGET=30
       - FPS_DOWNSAMPLE_THRESHOLD=500
-      - KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT
+      - KAFKA_SECURITY_PROTOCOL=SASL_SSL
       - KAFKA_SASL_USERNAME=${KAFKA_SASL_USERNAME:-admin}
       - KAFKA_SASL_PASSWORD=${KAFKA_SASL_PASSWORD:-admin-secret}
+    volumes:
+      - ./certs:/certs:ro
     networks:
       - ardd_net
     restart: unless-stopped
@@ -69,11 +141,26 @@ services:
     build:
       context: ./vision-service
       dockerfile: Dockerfile
-    container_name: vision-service
+    # container_name / fixed host port removed so `--scale vision-service=N`
+    # works (M6, mechanism demo). Traefik was tried as an explicit LB but its
+    # bundled Docker client can't negotiate with this environment's Docker
+    # Engine (29.4.0 / "moby v2" API 1.54 — confirmed via direct /_ping
+    # testing, a real environment incompatibility, not a config error).
+    # Falling back to Docker Compose's own embedded DNS (127.0.0.11), which
+    # round-robins across a scaled service's replica IPs natively — no extra
+    # infra needed. `call_vision()` already creates a fresh `httpx.AsyncClient`
+    # per request (no persistent connection pooling), so each request
+    # re-resolves DNS and naturally distributes across replicas. This proves
+    # DNS-based discovery/distribution across replicas sharing the single
+    # physical GPU — no real throughput gain is expected or claimed, and
+    # unlike an active-health-check LB, a dead replica's IP may still be
+    # returned until Compose's DNS reflects it stopped; the aggregation-service
+    # circuit breaker (M5) is what prevents a persistently-bad replica from
+    # taking down the whole pipeline.
     depends_on:
       - kafka
-    ports:
-      - "8001:8001"
+    expose:
+      - "8001"
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_FRAMES=frames
@@ -81,11 +168,16 @@ services:
       - MODEL_WEIGHTS_PATH=/app/weights/efficientnet_b4_ff++.pt
       - FFT_MLP_WEIGHTS_PATH=/app/weights/fft_mlp_ff++.pt
       - FUSION_WEIGHTS_PATH=/app/weights/fusion_alpha.npy
+      - CALIBRATION_PATH=/app/weights/calibration.pkl
+      - PROFILE=${PROFILE:-false}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
     volumes:
       - torch_hub_cache:/root/.cache/torch/hub
       - ./model-weights/efficientnet_b4_ff++.pt:/app/weights/efficientnet_b4_ff++.pt:ro
       - ./model-weights/fft_mlp_ff++.pt:/app/weights/fft_mlp_ff++.pt:ro
       - ./model-weights/fusion_alpha.npy:/app/weights/fusion_alpha.npy:ro
+      - ./model-weights/calibration.pkl:/app/weights/calibration.pkl:ro
+      - ./certs:/certs:ro
     networks:
       - ardd_net
     restart: unless-stopped
@@ -97,7 +189,9 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      # mTLS (M10): server requires a client cert, so the healthcheck presents
+      # this service's own cert to itself.
+      test: ["CMD", "curl", "-f", "--cert", "/certs/vision-service.crt", "--key", "/certs/vision-service.key", "--cacert", "/certs/ca.crt", "https://localhost:8001/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -116,11 +210,37 @@ services:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-tinyllama}
       - MOCK_LLM=${MOCK_LLM:-true}
+      - PROFILE=${PROFILE:-false}
+      - CHROMA_PERSIST_DIR=/data/chroma
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+    volumes:
+      - chroma_data:/data/chroma
+      - ./certs:/certs:ro
     networks:
       - ardd_net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      # mTLS (M10): server requires a client cert, so the healthcheck presents
+      # this service's own cert to itself.
+      test: ["CMD", "curl", "-f", "--cert", "/certs/rag-agent.crt", "--key", "/certs/rag-agent.key", "--cacert", "/certs/ca.crt", "https://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  webhook-receiver:
+    # Local demo target for M9's webhook fan-out (decision #1: generic local
+    # receiver instead of a real PagerDuty/SIEM account). Logs whatever it
+    # receives; GET /received lists recent events for manual verification.
+    build:
+      context: ./webhook-receiver
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    networks:
+      - ardd_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -129,35 +249,70 @@ services:
     build:
       context: ./aggregation-service
       dockerfile: Dockerfile
-    container_name: aggregation-service
+    # No container_name / fixed host port removed from replicas > 1 via
+    # `--scale` for Kafka rebalance testing (M3) — Compose forbids a fixed
+    # container_name when scaling, and can't bind "8003:8003" twice. For the
+    # single-replica default deployment this behaves exactly as before.
     depends_on:
       vision-service:
         condition: service_healthy
       rag-agent:
         condition: service_healthy
+      redis:
+        condition: service_started
+      webhook-receiver:
+        condition: service_started
+      minio:
+        condition: service_healthy
     ports:
       - "8003:8003"
     environment:
       # These env var names must match aggregation-service/main.py
-      - VISION_URL=http://vision-service:8001/infer
-      - RAG_URL=http://rag-agent:8002/audit
+      # Compose's embedded DNS round-robins across scaled vision-service
+      # replicas (M6) — see vision-service's comment for why not Traefik.
+      - VISION_URL=https://vision-service:8001/infer
+      - RAG_URL=https://rag-agent:8002/audit
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - JWT_SECRET=${JWT_SECRET}
+      # RBAC (M11): hardcoded admin/viewer role pairs, not a persistent user store.
+      - ADMIN_CLIENT_ID=${ADMIN_CLIENT_ID:-admin}
+      - ADMIN_CLIENT_SECRET=${ADMIN_CLIENT_SECRET:-admin-secret-change-me}
+      - VIEWER_CLIENT_ID=${VIEWER_CLIENT_ID:-viewer}
+      - VIEWER_CLIENT_SECRET=${VIEWER_CLIENT_SECRET:-viewer-secret-change-me}
+      # mlflow stays HTTP (M10 scope note): `mlflow server`'s CLI has no TLS
+      # flags at all — wrapping it would need a reverse-proxy sidecar, which
+      # is disproportionate for internal-only experiment tracking that never
+      # handles frame data or credentials beyond its own tracking token.
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_LABELS=labels
-      - WEBHOOK_URL=${WEBHOOK_URL:-}
-      - WEBHOOK_TOKEN=${WEBHOOK_TOKEN:-}
-      - KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT
+      # JSON array of {"url","token","format"} targets (M9 fan-out). Default
+      # lives in .env, not here — a literal JSON default would break Compose's
+      # ${VAR:-default} parsing (the first `}` in the JSON closes it early).
+      - WEBHOOK_TARGETS=${WEBHOOK_TARGETS:-[]}
+      - KAFKA_SECURITY_PROTOCOL=SASL_SSL
       - KAFKA_SASL_USERNAME=${KAFKA_SASL_USERNAME:-admin}
       - KAFKA_SASL_PASSWORD=${KAFKA_SASL_PASSWORD:-admin-secret}
+      - CA_CERT=/certs/ca.crt
       - ALERT_THRESHOLD=${ALERT_THRESHOLD:-0.90}
       - ALERT_WINDOW=${ALERT_WINDOW:-5}
+      - PROFILE=${PROFILE:-false}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      # Stream segment archival (M12) — local MinIO instead of real S3.
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin123}
+      - MINIO_BUCKET=${MINIO_BUCKET:-ardd-segments}
+    volumes:
+      - ./certs:/certs:ro
     networks:
       - ardd_net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      # mTLS (M10): aggregation-service is CERT_OPTIONAL (browser-facing, see
+      # its Dockerfile comment) so a plain HTTPS curl with just the CA works.
+      test: ["CMD", "curl", "-f", "--cacert", "/certs/ca.crt", "https://localhost:8003/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -166,30 +321,38 @@ services:
     build:
       context: ./temporal-service
       dockerfile: Dockerfile
-    container_name: temporal-service
+    # container_name removed so `--scale temporal-service=N` works for
+    # Kafka rebalance testing (M3) — see aggregation-service's note above.
     depends_on:
       kafka:
         condition: service_started
       aggregation-service:
         condition: service_healthy
+      redis:
+        condition: service_started
     ports:
       - "8004:8004"
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC_FRAMES=frames
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
-      - AGGREGATION_URL=http://aggregation-service:8003
+      - AGGREGATION_URL=https://aggregation-service:8003
       - MODEL_WEIGHTS_PATH=/app/weights/model_87_acc_20_frames_final_data.pt
-      - KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT
+      - KAFKA_SECURITY_PROTOCOL=SASL_SSL
       - KAFKA_SASL_USERNAME=${KAFKA_SASL_USERNAME:-admin}
       - KAFKA_SASL_PASSWORD=${KAFKA_SASL_PASSWORD:-admin-secret}
+      - CA_CERT=/certs/ca.crt
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ${TEMPORAL_WEIGHTS_PATH:-./temporal-service/weights/model_87_acc_20_frames_final_data.pt}:/app/weights/model_87_acc_20_frames_final_data.pt:ro
+      - ./certs:/certs:ro
     networks:
       - ardd_net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      # mTLS (M10): server requires a client cert, so the healthcheck presents
+      # this service's own cert to itself.
+      test: ["CMD", "curl", "-f", "--cert", "/certs/temporal-service.crt", "--key", "/certs/temporal-service.key", "--cacert", "/certs/ca.crt", "https://localhost:8004/health"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -199,8 +362,12 @@ services:
     image: ghcr.io/mlflow/mlflow:v2.11.1
     container_name: mlflow
     command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow-data/mlflow.db --default-artifact-root /mlflow-data/artifacts
-    ports:
-      - "5000:5000"
+    # No host port published (SEC-3): MLflow OSS ignores MLFLOW_TRACKING_TOKEN
+    # entirely, so publishing 5000 directly meant anyone on the host network
+    # could read/write experiment data unauthenticated. Internal services
+    # (aggregation-service) still reach it directly at http://mlflow:5000 on
+    # the trusted ardd_net bridge network — only host/browser access now goes
+    # through mlflow-proxy, which does enforce auth.
     environment:
       - MLFLOW_TRACKING_TOKEN=${MLFLOW_TRACKING_TOKEN}
     volumes:
@@ -213,6 +380,27 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  mlflow-proxy:
+    # SEC-3: HTTP basic-auth reverse proxy in front of MLflow's host-exposed
+    # port, since `mlflow server` has no native auth. Small and proportionate
+    # (one nginx sidecar) versus MLflow being internal-only experiment
+    # tracking that never handles frame data.
+    build:
+      context: ./mlflow-proxy
+      dockerfile: Dockerfile
+    container_name: mlflow-proxy
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      - MLFLOW_PROXY_USER=${MLFLOW_PROXY_USER:-admin}
+      - MLFLOW_PROXY_PASSWORD=${MLFLOW_PROXY_PASSWORD:-mlflow-proxy-secret-change-me}
+    ports:
+      - "5000:5000"
+    networks:
+      - ardd_net
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
@@ -236,11 +424,20 @@ services:
       temporal-service:
         condition: service_healthy
     environment:
-      # Vite reads VITE_* env vars at build time via import.meta.env
-      - VITE_API_URL=http://localhost:8003
-      - VITE_WS_URL=ws://localhost:8003/stream
-      - VITE_CLIENT_ID=${CLIENT_ID:-test_client}
-      - VITE_CLIENT_SECRET=${CLIENT_SECRET:-test_secret}
+      # Vite reads VITE_* env vars at build time via import.meta.env. mTLS
+      # (M10): aggregation-service is CERT_OPTIONAL, so the browser doesn't
+      # need a client cert — it just needs to trust the local CA once (see
+      # scripts/gen_certs.sh's printed instructions) to avoid a cert warning.
+      - VITE_API_URL=https://localhost:8003
+      - VITE_WS_URL=wss://localhost:8003/stream
+      # RBAC (M11): defaults to the read-only "viewer" role pair. To demo the
+      # admin-gated UI (AdminPanel), set FRONTEND_CLIENT_ID/SECRET in .env to
+      # match ADMIN_CLIENT_ID/ADMIN_CLIENT_SECRET before `docker-compose up
+      # frontend` — these were previously named CLIENT_ID/CLIENT_SECRET, which
+      # don't exist anywhere in .env/.env.example, so the frontend silently
+      # always logged in as viewer regardless of intent.
+      - VITE_CLIENT_ID=${FRONTEND_CLIENT_ID:-viewer}
+      - VITE_CLIENT_SECRET=${FRONTEND_CLIENT_SECRET:-viewer-secret-change-me}
     ports:
       - "3000:3000"
     networks:
@@ -256,3 +453,5 @@ volumes:
   torch_hub_cache:
   ollama_models:
   mlflow_data:
+  chroma_data:
+  minio_data:

@@ -32,17 +32,127 @@ def test_health():
 # ── Auth token ───────────────────────────────────────────────────────────────
 
 def test_auth_token_fields():
-    """POST /auth/token returns access_token AND expires_in: 3600 (API_SPEC §6)."""
-    r = client.post("/auth/token", json={"client_id": "c", "client_secret": "s"})
+    """POST /auth/token returns access_token, refresh_token, expires_in: 900 (SEC-4)."""
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
     assert r.status_code == 200
     d = r.json()
     assert "access_token" in d
-    assert d["expires_in"] == 3600
+    assert "refresh_token" in d
+    assert d["expires_in"] == 900
 
 def test_auth_token_empty_creds():
     """Empty credentials return 401."""
     r = client.post("/auth/token", json={"client_id": "", "client_secret": ""})
     assert r.status_code == 401
+
+def test_auth_token_invalid_creds():
+    """Non-empty but unrecognized credentials return 401 (M11: real lookup
+    against ADMIN_CLIENT_ID/VIEWER_CLIENT_ID pairs, not 'any non-empty string')."""
+    r = client.post("/auth/token", json={"client_id": "not_a_real_client", "client_secret": "nope"})
+    assert r.status_code == 401
+
+def test_auth_token_viewer_role_claim():
+    """Viewer credentials issue a JWT with role=viewer."""
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
+    assert r.status_code == 200
+    token = r.json()["access_token"]
+    decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    assert decoded["role"] == "viewer"
+
+def test_auth_token_admin_role_claim():
+    """Admin credentials issue a JWT with role=admin."""
+    r = client.post("/auth/token", json={"client_id": "admin", "client_secret": "admin-secret-change-me"})
+    assert r.status_code == 200
+    token = r.json()["access_token"]
+    decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    assert decoded["role"] == "admin"
+
+
+# ── Auth refresh/revoke (SEC-4) ─────────────────────────────────────────────
+
+def test_refresh_issues_new_valid_access_token():
+    """POST /auth/refresh with a valid refresh_token returns a fresh, usable access token."""
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
+    refresh_token = r.json()["refresh_token"]
+    r2 = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    assert r2.status_code == 200
+    d = r2.json()
+    assert "access_token" in d and "refresh_token" in d
+    decoded = jwt.decode(d["access_token"], JWT_SECRET, algorithms=["HS256"])
+    assert decoded["role"] == "viewer" and decoded["type"] == "access"
+
+def test_refresh_rejects_access_token():
+    """An access token (not a refresh token) is rejected by /auth/refresh."""
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
+    access_token = r.json()["access_token"]
+    r2 = client.post("/auth/refresh", json={"refresh_token": access_token})
+    assert r2.status_code == 401
+
+def test_refresh_token_single_use():
+    """A refresh token is revoked after use — replaying it fails (rotation)."""
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
+    refresh_token = r.json()["refresh_token"]
+    r1 = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    assert r1.status_code == 200
+    r2 = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    assert r2.status_code == 401
+
+def test_refresh_expired_token_rejected():
+    """An expired refresh token is rejected."""
+    expired = jwt.encode(
+        {"sub": "viewer", "role": "viewer", "type": "refresh", "jti": "x", "exp": time.time() - 10},
+        JWT_SECRET, algorithm="HS256",
+    )
+    r = client.post("/auth/refresh", json={"refresh_token": expired})
+    assert r.status_code == 401
+
+def test_revoke_then_reject_by_require_role():
+    """POST /auth/revoke on an admin token makes require_role() reject it afterwards."""
+    r = client.post("/auth/token", json={"client_id": "admin", "client_secret": "admin-secret-change-me"})
+    token = r.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    r_ok = client.post("/admin/reset_breaker", json={"target": "vision"}, headers=headers)
+    assert r_ok.status_code == 200
+    r_revoke = client.post("/auth/revoke", headers=headers)
+    assert r_revoke.status_code == 200
+    r_after = client.post("/admin/reset_breaker", json={"target": "vision"}, headers=headers)
+    assert r_after.status_code == 401
+
+
+# ── RBAC: require_role gating (M11) ───────────────────────────────────────────
+
+def _token_for(client_id: str, client_secret: str) -> str:
+    r = client.post("/auth/token", json={"client_id": client_id, "client_secret": client_secret})
+    return r.json()["access_token"]
+
+def test_admin_endpoint_no_token_401():
+    """No Authorization header → 401 (unauthenticated), not 403."""
+    r = client.post("/admin/reset_breaker", json={"target": "vision"})
+    assert r.status_code == 401
+
+def test_admin_endpoint_viewer_role_403():
+    """Valid viewer JWT, wrong role → 403 (authenticated but not authorized),
+    not 401 — this is the exact distinction TESTING.md/the M11 plan calls for."""
+    token = _token_for("viewer", "viewer-secret-change-me")
+    r = client.post("/admin/reset_breaker", json={"target": "vision"},
+                     headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+
+@patch("httpx.AsyncClient.post")
+def test_admin_endpoint_admin_role_200(mock_post):
+    """Valid admin JWT → 200, an actually-open breaker gets reset to closed."""
+    import main
+    mock_post.side_effect = Exception("Vision Down")
+    for i in range(main._vision_breaker.fail_max):
+        client.post("/aggregate", json=make_payload(stream_id="admin_reset_1", frame_index=i), headers=HEADERS)
+    assert client.get("/health").json()["vision_circuit_state"] == "open"
+
+    token = _token_for("admin", "admin-secret-change-me")
+    r = client.post("/admin/reset_breaker", json={"target": "vision"},
+                     headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+    assert r.json()["reset"] == ["vision"]
+    assert client.get("/health").json()["vision_circuit_state"] == "closed"
 
 
 # ── Auth: X-API-Key ───────────────────────────────────────────────────────────
@@ -126,9 +236,15 @@ def test_rag_timeout_fallback(mock_rag, mock_vision):
 
 # ── Unit: alert threshold & reset (TESTING.md §2) ───────────────────────────
 
+@patch("main._upload_segment_sync")  # crossing the alert threshold now also
+# triggers M12's archival hook — mocked here since this test isn't about
+# archival and a real (unmocked) MinIO call would try to resolve an
+# unreachable host, which is slow enough on this bare-host test environment
+# to stall the rest of the suite (Docker's embedded DNS is instant; this
+# WSL host's negative-DNS-response latency is not).
 @patch("main.call_vision")
 @patch("main.call_rag")
-def test_alert_threshold(mock_rag, mock_vision):
+def test_alert_threshold(mock_rag, mock_vision, mock_upload):
     """alert=true after 5 consecutive frames with final_score > 0.90 (TESTING.md §2)."""
     mock_vision.return_value = {"deepfake_score": 0.95}
     mock_rag.return_value = {"audit_verdict": "UNKNOWN"}
@@ -139,9 +255,10 @@ def test_alert_threshold(mock_rag, mock_vision):
     resp = client.post("/aggregate", json=make_payload(stream_id=sid, frame_index=5), headers=HEADERS)
     assert resp.json()["alert"] is True
 
+@patch("main._upload_segment_sync")  # see test_alert_threshold's comment
 @patch("main.call_vision")
 @patch("main.call_rag")
-def test_alert_resets(mock_rag, mock_vision):
+def test_alert_resets(mock_rag, mock_vision, mock_upload):
     """alert resets to false after a frame with final_score < 0.90 (TESTING.md §2)."""
     mock_vision.return_value = {"deepfake_score": 0.95}
     mock_rag.return_value = {"audit_verdict": "UNKNOWN"}
@@ -171,6 +288,149 @@ def test_vision_http_500_causes_502(mock_vision):
     mock_vision.side_effect = HTTPException(status_code=502, detail="Vision Service Error")
     r = client.post("/aggregate", json=make_payload(stream_id="err_2"), headers=HEADERS)
     assert r.status_code == 502
+
+
+# ── Circuit breaker on Vision/RAG calls (M5) ─────────────────────────────────
+
+@patch("httpx.AsyncClient.post")
+def test_vision_circuit_breaker_opens_after_failures(mock_post):
+    """After VISION_BREAKER_FAIL_MAX consecutive failures, the breaker opens
+    and subsequent calls fail fast (visible via /health) instead of waiting
+    out the full httpx timeout on every frame."""
+    import main
+    mock_post.side_effect = Exception("Vision Down")
+    for i in range(main._vision_breaker.fail_max):
+        r = client.post("/aggregate", json=make_payload(stream_id="breaker_1", frame_index=i), headers=HEADERS)
+        assert r.status_code == 502
+    assert client.get("/health").json()["vision_circuit_state"] == "open"
+    # Further calls fail fast without attempting the network call again
+    calls_before = mock_post.call_count
+    r = client.post("/aggregate", json=make_payload(stream_id="breaker_1", frame_index=99), headers=HEADERS)
+    assert r.status_code == 502
+    assert mock_post.call_count == calls_before  # breaker short-circuited, no new call attempted
+    main._vision_breaker.close()  # reset for subsequent tests
+
+
+# ── Stream segment archival to MinIO (M12) ────────────────────────────────────
+
+@patch("main._upload_segment_sync")
+@patch("main.call_vision")
+@patch("main.call_rag")
+def test_archival_fires_once_per_alert_streak(mock_rag, mock_vision, mock_upload):
+    """Archival uploads exactly once on the frame that crosses ALERT_WINDOW,
+    not on every subsequent alerted frame in the same streak."""
+    import main
+    mock_vision.return_value = {"deepfake_score": 0.95}
+    mock_rag.return_value = {"audit_verdict": "PASS"}
+    stream_id = "archive_test_1"
+    # Send ALERT_WINDOW + 3 consecutive alerting frames — streak stays open throughout.
+    for i in range(main.ALERT_WINDOW + 3):
+        r = client.post("/aggregate", json=make_payload(stream_id=stream_id, frame_index=i), headers=HEADERS)
+        assert r.status_code == 200
+    assert mock_upload.call_count == 1
+    called_stream_id, called_frame_index, _ = mock_upload.call_args[0]
+    assert called_stream_id == stream_id
+    assert called_frame_index == main.ALERT_WINDOW - 1  # 0-indexed: frame ALERT_WINDOW-1 is the Nth frame
+
+@patch("main._upload_segment_sync")
+@patch("main.call_vision")
+@patch("main.call_rag")
+def test_archival_retriggers_after_streak_resets(mock_rag, mock_vision, mock_upload):
+    """A second streak (after the counter resets to 0) archives again."""
+    import main
+    stream_id = "archive_test_2"
+    mock_rag.return_value = {"audit_verdict": "PASS"}
+
+    mock_vision.return_value = {"deepfake_score": 0.95}
+    for i in range(main.ALERT_WINDOW):
+        client.post("/aggregate", json=make_payload(stream_id=stream_id, frame_index=i), headers=HEADERS)
+    assert mock_upload.call_count == 1
+
+    mock_vision.return_value = {"deepfake_score": 0.1}  # below threshold — resets the streak
+    client.post("/aggregate", json=make_payload(stream_id=stream_id, frame_index=100), headers=HEADERS)
+
+    mock_vision.return_value = {"deepfake_score": 0.95}
+    for i in range(main.ALERT_WINDOW):
+        client.post("/aggregate", json=make_payload(stream_id=stream_id, frame_index=200 + i), headers=HEADERS)
+    assert mock_upload.call_count == 2
+
+
+# ── Webhook multi-target fan-out (M9) ────────────────────────────────────────
+
+def test_format_for_target_generic_passthrough():
+    from main import _format_for_target
+    payload = {"event": "DEEPFAKE_ALERT", "stream_id": "s1"}
+    assert _format_for_target(payload, "generic") == payload
+
+
+def test_format_for_target_slack_shape():
+    from main import _format_for_target
+    payload = {
+        "stream_id": "s1", "frame_index": 5, "final_score": 0.95,
+        "audit_verdict": "FAIL", "matched_signature": "FaceSwap-v2-GAN",
+        "consecutive_alert_frames": 5,
+    }
+    body = _format_for_target(payload, "slack")
+    assert "text" in body
+    assert "s1" in body["text"] and "FaceSwap-v2-GAN" in body["text"]
+
+
+@patch("httpx.AsyncClient.post")
+@pytest.mark.asyncio
+async def test_webhook_fanout_delivers_to_all_targets(mock_post):
+    import main
+    mock_post.return_value.raise_for_status = lambda: None
+    targets = [
+        {"url": "http://receiver-a/webhook", "format": "generic"},
+        {"url": "http://receiver-b/webhook", "format": "slack"},
+    ]
+    with patch.object(main, "WEBHOOK_TARGETS", targets):
+        await main._deliver_webhook_fanout({
+            "stream_id": "s1", "frame_index": 0, "final_score": 0.9,
+            "audit_verdict": "FAIL", "matched_signature": None,
+            "consecutive_alert_frames": 5, "timestamp_ms": 0,
+        })
+    called_urls = {c.args[0] for c in mock_post.call_args_list}
+    assert called_urls == {"http://receiver-a/webhook", "http://receiver-b/webhook"}
+
+
+@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("httpx.AsyncClient.post")
+@pytest.mark.asyncio
+async def test_webhook_fanout_bad_target_does_not_block_others(mock_post, mock_sleep):
+    """One target that always fails must not prevent delivery to a working target."""
+    import main
+
+    async def side_effect(url, **kwargs):
+        if url == "http://bad-target/webhook":
+            raise Exception("connection refused")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        return mock_resp
+
+    mock_post.side_effect = side_effect
+    targets = [
+        {"url": "http://bad-target/webhook", "format": "generic"},
+        {"url": "http://good-target/webhook", "format": "generic"},
+    ]
+    with patch.object(main, "WEBHOOK_TARGETS", targets):
+        await main._deliver_webhook_fanout({
+            "stream_id": "s1", "frame_index": 0, "final_score": 0.9,
+            "audit_verdict": "FAIL", "matched_signature": None,
+            "consecutive_alert_frames": 5, "timestamp_ms": 0,
+        })
+    good_calls = [c for c in mock_post.call_args_list if c.args[0] == "http://good-target/webhook"]
+    bad_calls = [c for c in mock_post.call_args_list if c.args[0] == "http://bad-target/webhook"]
+    assert len(good_calls) == 1  # succeeded on first attempt
+    assert len(bad_calls) == 3  # retried max_attempts times, still failed
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_blocked_for_invalid_target_url():
+    import main
+    with patch("httpx.AsyncClient.post") as mock_post:
+        await main._deliver_webhook({"url": "not-a-url", "format": "generic"}, {"stream_id": "s1"})
+    mock_post.assert_not_called()
 
 
 # ── Integration: full AggregatedResult schema (TESTING.md §3) ────────────────
@@ -233,7 +493,7 @@ def test_websocket_expired_token():
 
 def test_websocket_valid_token_connects():
     """WebSocket with valid JWT via subprotocol → connection accepted (TESTING.md §3)."""
-    r = client.post("/auth/token", json={"client_id": "c", "client_secret": "s"})
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
     token = r.json()["access_token"]
     with client.websocket_connect("/stream", headers={"Sec-WebSocket-Protocol": token}) as ws:
         assert ws is not None
@@ -246,7 +506,7 @@ def test_vision_error_broadcasts_pipeline_error(mock_vision):
     """Vision failure → pipeline_error event emitted to WebSocket (TESTING.md §3)."""
     mock_vision.side_effect = Exception("Vision Down")
 
-    r = client.post("/auth/token", json={"client_id": "c", "client_secret": "s"})
+    r = client.post("/auth/token", json={"client_id": "viewer", "client_secret": "viewer-secret-change-me"})
     token = r.json()["access_token"]
 
     # Connect WebSocket, fire aggregate in same thread (TestClient is sync)

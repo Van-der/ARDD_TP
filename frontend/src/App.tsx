@@ -1,18 +1,25 @@
 import { useState, useEffect, useRef } from 'react';
 import { ShieldCheck, Activity, ServerCrash, AlertCircle, Sun, Moon } from 'lucide-react';
 import { useStore } from './store';
+import { decodeJwtRole } from './jwt';
 import { LiveGraph } from './components/LiveGraph';
 import { AuditPanel } from './components/AuditPanel';
 import { AlertBanner } from './components/AlertBanner';
 import { FlaggedFrames } from './components/FlaggedFrames';
+import { AdminPanel } from './components/AdminPanel';
 import './index.css';
 
 // Read URLs from Vite env vars (set in docker-compose or .env)
 // Fallback to localhost for local development outside Docker
-const CLIENT_ID = import.meta.env.VITE_CLIENT_ID ?? 'test_client';
-const CLIENT_SECRET = import.meta.env.VITE_CLIENT_SECRET ?? 'test_secret';
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8003';
-const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8003/stream';
+// RBAC (M11): defaults to the read-only "viewer" role pair. Set
+// VITE_CLIENT_ID/VITE_CLIENT_SECRET to the admin pair to see admin-only UI.
+const CLIENT_ID = import.meta.env.VITE_CLIENT_ID ?? 'viewer';
+const CLIENT_SECRET = import.meta.env.VITE_CLIENT_SECRET ?? 'viewer-secret-change-me';
+// https/wss (M10 mTLS) — the local CA must be trusted once in-browser, see
+// scripts/gen_certs.sh's printed instructions, or these requests will fail
+// with a cert error.
+const API_URL = import.meta.env.VITE_API_URL ?? 'https://localhost:8003';
+const WS_URL = import.meta.env.VITE_WS_URL ?? 'wss://localhost:8003/stream';
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 const BASE_BACKOFF_MS = 500;
@@ -38,6 +45,9 @@ export default function App() {
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef<number>(0);
   const maxRetriesExhausted = useRef<boolean>(false);
+  // SEC-4: refresh_token doesn't need to be React state — it's never rendered,
+  // only read by refreshAccessToken(), so a ref avoids an extra re-render.
+  const refreshTokenRef = useRef<string | null>(null);
 
   // JWT Auth logic — retries once on failure before giving up
   const authenticate = async (isRetry = false): Promise<void> => {
@@ -50,6 +60,7 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setToken(data.access_token);
+        refreshTokenRef.current = data.refresh_token;
       } else if (!isRetry) {
         console.warn('Auth failed, retrying once...');
         await authenticate(true);
@@ -64,6 +75,33 @@ export default function App() {
         console.error('Auth exception after retry:', e);
         setConnectionError(true);
       }
+    }
+  };
+
+  // SEC-4: access tokens are short-lived (15 min) — refresh via the rotating
+  // refresh_token instead of a full re-login; falls back to authenticate()
+  // (full re-login) if the refresh token itself is missing/expired/revoked.
+  const refreshAccessToken = async (): Promise<void> => {
+    if (!refreshTokenRef.current) {
+      await authenticate();
+      return;
+    }
+    try {
+      const res = await fetch(`${API_URL}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshTokenRef.current })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setToken(data.access_token);
+        refreshTokenRef.current = data.refresh_token;
+      } else {
+        await authenticate();
+      }
+    } catch (e) {
+      console.warn('Token refresh failed, falling back to full re-login:', e);
+      await authenticate();
     }
   };
 
@@ -136,8 +174,9 @@ export default function App() {
 
     connect();
 
-    // JWT Refresh at 55 minutes (3300s before 3600s expiry)
-    const refreshInterval = setInterval(() => authenticate(), 3300 * 1000);
+    // SEC-4: access token TTL is 900s (15 min) — refresh at 800s, comfortably
+    // before expiry, via the rotating refresh token instead of re-authenticating.
+    const refreshInterval = setInterval(() => refreshAccessToken(), 800 * 1000);
 
     return () => {
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
@@ -209,6 +248,7 @@ export default function App() {
         <aside className="flex-col gap-4">
           <h2>Audit Reports</h2>
           <AuditPanel />
+          {decodeJwtRole(token) === 'admin' && <AdminPanel apiUrl={API_URL} token={token!} />}
         </aside>
       </main>
     </div>

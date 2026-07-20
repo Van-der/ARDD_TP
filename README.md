@@ -51,13 +51,16 @@ Real-time video stream analysis pipeline built on a **Lambda Architecture** — 
 | Layer | Technology |
 |---|---|
 | Ingest Gateway | Python, OpenCV, FFmpeg, `kafka-python-ng` |
-| Message Broker | Apache Kafka (SASL_PLAINTEXT) |
-| **Speed Layer** — Vision Service | PyTorch — EfficientNet-B4 (fine-tuned) + FFT MLP (trained), MTCNN, FastAPI |
-| **Batch Layer** — Temporal Service | PyTorch — ResNext50+LSTM (`Naman712/Deep-fake-detection`), `aiokafka`, FastAPI |
-| Frame Buffer (Batch Layer) | In-memory `deque(maxlen=20)` per stream; Redis in Phase 3 |
-| Context Agent | LangChain (RAG, FAISS, `sentence-transformers`, Ollama/Mistral) |
-| Aggregation Service | Python, FastAPI, `aiokafka`, WebSockets (JWT via `Sec-WebSocket-Protocol`) |
-| Experiment Tracking | MLflow |
+| Message Broker | Apache Kafka (SASL_SSL — TLS transport + SASL PLAIN auth) |
+| **Speed Layer** — Vision Service | PyTorch — EfficientNet-B4 (fine-tuned) + FFT MLP (trained) + isotonic calibration, MTCNN, FastAPI, mTLS |
+| **Batch Layer** — Temporal Service | PyTorch — ResNext50+LSTM (`Naman712/Deep-fake-detection`), `aiokafka`, FastAPI, mTLS |
+| Frame Buffer (Batch Layer) | Redis List per stream + atomic Lua push/flush |
+| Context Agent | LangChain (RAG, persistent ChromaDB, `sentence-transformers`, Ollama/Mistral), mTLS |
+| Aggregation Service | Python, FastAPI, `aiokafka`, WebSockets (JWT via `Sec-WebSocket-Protocol`, short-lived access + refresh tokens), TLS (browser-facing) |
+| RBAC | Hardcoded admin/viewer role pairs baked into JWT claims |
+| Tracing | OpenTelemetry → local Jaeger (no cloud APM) |
+| Object Storage | MinIO (S3-compatible) — per-alert-streak segment archival |
+| Experiment Tracking | MLflow, behind an nginx basic-auth proxy |
 | Frontend | React + TypeScript + Vite + Zustand + Recharts |
 | Infrastructure | Docker, Docker Compose |
 
@@ -130,10 +133,14 @@ temporal_score = F.softmax(logits, dim=1)[0][0].item()             # fake class 
 
 ## Security
 
+See `PLAN/SECURITY.md` for the full spec. Summary:
+
 - Internal REST APIs require `X-API-Key` header on every request.
-- WebSocket access requires a JWT bearer token (HS256, 1-hour expiry) from `POST /auth/token`, passed via `Sec-WebSocket-Protocol` subprotocol header — not the URL, to prevent token leakage in server access logs.
+- WebSocket access requires a JWT bearer token (HS256, **15-minute** access-token expiry, rotating refresh tokens via `POST /auth/refresh`, self-service revocation via `POST /auth/revoke`) from `POST /auth/token`, passed via `Sec-WebSocket-Protocol` subprotocol header — not the URL, to prevent token leakage in server access logs.
+- RBAC: hardcoded admin/viewer role pairs baked into JWT claims; `POST /admin/*` endpoints are role-gated (403 vs 401).
 - All secrets injected via environment variables — see `.env.example`.
-- Kafka uses SASL_PLAINTEXT authentication (PLAIN mechanism) across all services. Full TLS (SASL_SSL) is deferred to Phase 5.
+- Kafka uses SASL_SSL (TLS transport + SASL PLAIN auth). Vision/RAG/Temporal Service require mutual TLS (mTLS); Aggregation Service (browser-facing) uses server-auth TLS only. See `scripts/gen_certs.sh` for the local CA and one-time browser trust-store import.
+- MLflow (no native auth) sits behind an `mlflow-proxy` nginx sidecar enforcing HTTP basic auth on its host-exposed port.
 - PyTorch model weights loaded with `weights_only=True` to prevent arbitrary code execution.
 
 ---
@@ -181,6 +188,8 @@ docker compose down -v
 
 > **First startup:** Docker will pull images and build services — allow 2–3 minutes. Services wait for their dependencies to become healthy before starting.
 
+> **Reclaiming disk space:** repeated `docker compose build`/`up -d --build` cycles during development can accumulate a large build cache. Run `./scripts/docker_cleanup.sh` after a heavy session (age-filtered, non-destructive — only prunes build cache older than 24h and dangling images; pass `--aggressive` for a deeper, full prune).
+
 ### Pull the Ollama LLM Model (one-time, optional)
 
 By default the RAG agent runs in mock mode (`MOCK_LLM=true` in `.env`). To use the real Mistral LLM:
@@ -189,6 +198,48 @@ By default the RAG agent runs in mock mode (`MOCK_LLM=true` in `.env`). To use t
 docker exec ollama ollama pull mistral
 # Then set MOCK_LLM=false in .env and restart: docker compose up -d rag-agent
 ```
+
+---
+
+## Running Locally (dashboard in your browser)
+
+The stack runs over TLS/mTLS end-to-end (M10), so there's one extra one-time step versus a plain HTTP app: trusting the local CA.
+
+```bash
+# 1. Generate certs (skip if certs/ already exists — it's gitignored, one-time per checkout)
+./scripts/gen_certs.sh
+# Prints one-time instructions for importing certs/ca.crt into your OS/browser
+# trust store (Chrome/Edge: chrome://settings/certificates → Authorities → Import).
+# Without this, https://localhost:8003 and the dashboard will show a cert warning.
+
+# 2. Configure secrets (if not already done — see First-Time Setup above)
+cp .env.example .env
+
+# 3. Start everything, including the frontend
+docker compose up -d --build
+
+# 4. Open the dashboard
+#    http://localhost:3000  (the frontend container itself is plain HTTP;
+#    only its calls to aggregation-service at :8003 are HTTPS/WSS)
+```
+
+By default the dashboard logs in as the read-only **viewer** role. To see the RBAC-gated Admin Panel (circuit-breaker reset), set in `.env` before starting the `frontend` service:
+
+```bash
+FRONTEND_CLIENT_ID=admin
+FRONTEND_CLIENT_SECRET=<your ADMIN_CLIENT_SECRET value>
+```
+
+**Hybrid dev mode** (faster iteration on frontend code): keep the backend dockerized, run the frontend locally with hot reload —
+
+```bash
+docker compose up -d aggregation-service vision-service rag-agent temporal-service kafka redis minio otel-collector jaeger webhook-receiver
+cd frontend && npm install && npm run dev
+```
+
+Vite reads the same `VITE_*` defaults (`https://localhost:8003`), so this works as long as step 1's CA is trusted — CORS is wide open (`*`) so the dev server's port doesn't matter.
+
+**Deploying beyond localhost** (a real domain, real TLS, a real reverse proxy) is out of scope for this pass — see `PLAN/SECURITY.md`/`PLAN/PHASES.md` for what's already in place versus genuinely deferred.
 
 ---
 
@@ -303,10 +354,13 @@ ARDD_TP/
 | RAG Agent | 8002 | `POST /audit`, `GET /health` |
 | Aggregation Service | 8003 | `POST /auth/token`, `POST /temporal_audit`, `GET /health`, `ws://.../stream` |
 | Temporal Service | 8004 | `GET /health`, `GET /batch_status`, `POST /flush` |
-| MLflow | 5000 | Web UI + tracking API |
-| Kafka | 9092 | Broker (SASL_PLAINTEXT) |
-| Ollama | 11434 | LLM inference API |
-| Frontend | 3000 | React dashboard |
+| MLflow (via mlflow-proxy) | 5000 | Web UI + tracking API, HTTP basic auth (`MLFLOW_PROXY_USER`/`PASSWORD`) |
+| Kafka | 9092 / 29092 | Broker (SASL_SSL) — internal / external listener |
+| Ollama | 11434 | LLM inference API (internal only) |
+| Frontend | 3000 | React dashboard (plain HTTP; its calls to :8003 are HTTPS/WSS) |
+| Jaeger | 16686 | Trace UI |
+| MinIO | 9002 (API), 9001 (console) | S3-compatible object storage |
+| Redis | 6379 | Internal only, not published to host |
 
 ---
 
@@ -315,12 +369,12 @@ ARDD_TP/
 | Service | Tests | Coverage |
 |---|---|---|
 | Ingest Gateway | 4 | Kafka publish, FPS downsampling, SASL config, auth |
-| Vision Service | 16 | Spatial branch, frequency branch, score formula, alignment failure, payload limits, auth |
-| RAG Agent | 11 | FAISS search, verdict tiers (score × severity × tags), summary field, similarity threshold, payload validation, auth |
-| Aggregation Service | 30 | Full pipeline, Vision 502, RAG timeout, WebSocket JWT, alert window, drift, temporal audit, MLflow buffer, stream_id validation, payload size guard, rate limiting, SASL env vars |
+| Vision Service | 20 | Spatial branch, frequency branch, score formula, alignment failure, payload limits, auth, M13 calibration |
+| RAG Agent | 13 | FAISS/Chroma search, verdict tiers (score × severity × tags), summary field, similarity threshold, payload validation, auth, mTLS |
+| Aggregation Service | 49 | Full pipeline, Vision 502, RAG timeout, WebSocket JWT/refresh/revoke, RBAC, alert window, drift, temporal audit, MLflow buffer, stream_id validation, payload size guard, rate limiting, SASL/mTLS env vars, MinIO archival, webhooks |
 | Temporal Service | 20 | Buffer fill, tensor shape, zero-padding, sparse fallback, full inference, interpolation, schema validation, auth |
 | Frontend (Vitest) | 5 | Zustand store: frame buffer cap, sticky alert, dismiss, connection state, temporal status |
-| **Total** | **81** | **All 81 pass on host (Python 3.13.13 + Node 24)** |
+| **Total** | **111** | **All 111 pass (Python 3.13.13 + Node 24)** |
 
 > Vision-service tests run natively on the host — the Python 3.14 / facenet-pytorch incompatibility no longer applies (host is Python 3.13.13).
 

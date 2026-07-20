@@ -1,6 +1,8 @@
 import os
 import base64
+import pickle
 import time
+import logging
 import cv2
 import numpy as np
 import torch
@@ -9,6 +11,12 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from facenet_pytorch import MTCNN
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from modeling import SpatialBranch, FftMlp, compute_fft_features, IMAGENET_MEAN, IMAGENET_STD
 
@@ -20,10 +28,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+PROFILE = os.getenv("PROFILE", "false").lower() == "true"
+
+# OpenTelemetry tracing (M8) — local Jaeger via otel-collector, no cloud APM.
+# Converts M0's throwaway PROFILE logging into permanent, queryable traces.
+_otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+if _otel_endpoint:
+    _provider = TracerProvider(resource=Resource.create({"service.name": "vision-service"}))
+    _provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=_otel_endpoint, insecure=True)))
+    trace.set_tracer_provider(_provider)
+    FastAPIInstrumentor.instrument_app(app)
+tracer = trace.get_tracer(__name__)
+
 INTERNAL_API_KEY  = os.getenv("INTERNAL_API_KEY", "test-key")
 SPATIAL_WEIGHTS   = os.getenv("MODEL_WEIGHTS_PATH", "/app/weights/efficientnet_b4_ff++.pt")
 FFT_MLP_WEIGHTS   = os.getenv("FFT_MLP_WEIGHTS_PATH", "/app/weights/fft_mlp_ff++.pt")
 FUSION_WEIGHTS    = os.getenv("FUSION_WEIGHTS_PATH", "/app/weights/fusion_alpha.npy")
+CALIBRATION_PATH  = os.getenv("CALIBRATION_PATH", "/app/weights/calibration.pkl")
 START_TIME        = time.time()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,12 +102,36 @@ else:
     print(f"No fusion weights at {FUSION_WEIGHTS}. Defaulting to 0.6/0.4 blend.")
 
 
+# ── Confidence calibration (M13) ───────────────────────────────────────────────
+# Isotonic regression fit on the same val split used for the fusion logistic
+# regression (see fit_calibration.py) — reshapes the fused score's mapping to
+# empirical accuracy without changing its rank order (AUC-preserving).
+calibrator = None
+calibration_trained = False
+if os.path.exists(CALIBRATION_PATH):
+    try:
+        with open(CALIBRATION_PATH, "rb") as f:
+            calibrator = pickle.load(f)
+        calibration_trained = True
+        print(f"Loaded calibration from {CALIBRATION_PATH}")
+    except Exception as e:
+        print(f"Failed to load calibration: {e}. Scores will be uncalibrated.")
+else:
+    print(f"No calibration at {CALIBRATION_PATH}. Scores will be uncalibrated.")
+
+
+def calibrate(score: float) -> float:
+    if calibrator is not None:
+        return float(calibrator.predict([score])[0])
+    return score
+
+
 def fuse(spatial_score: float, freq_score: float) -> float:
     if fusion_params is not None:
         logit = (fusion_params[0] * spatial_score
                  + fusion_params[1] * freq_score
                  + fusion_params[2])
-        return float(torch.sigmoid(torch.tensor(logit)).item())
+        return calibrate(float(torch.sigmoid(torch.tensor(logit)).item()))
     return 0.6 * spatial_score + 0.4 * freq_score
 
 
@@ -132,6 +180,7 @@ async def verify_api_key(request: Request):
 @app.post("/infer", response_model=VisionResult, dependencies=[Depends(verify_api_key)])
 async def infer(payload: FramePayload):
     start_time = time.time()
+    t_start = time.perf_counter()
 
     try:
         raw_bytes = base64.b64decode(payload.payload)
@@ -147,10 +196,14 @@ async def infer(payload: FramePayload):
             raise ValueError("Could not decode image")
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        boxes, _ = mtcnn.detect(img_rgb)
+        t_decode = time.perf_counter()
+        with tracer.start_as_current_span("mtcnn_detect"):
+            boxes, _ = mtcnn.detect(img_rgb)
+        t_mtcnn = time.perf_counter()
 
         aligned       = False
         deepfake_score = 0.5
+        t_spatial = t_freq = t_mtcnn
 
         if boxes is not None and len(boxes) > 0:
             aligned = True
@@ -167,12 +220,16 @@ async def infer(payload: FramePayload):
             tensor = (torch.from_numpy(face_380)
                       .permute(2, 0, 1).float().unsqueeze(0) / 255.0).to(device)
             tensor = (tensor - _MEAN) / _STD
-            with torch.no_grad():
-                spatial_score = spatial_branch(tensor).item()
+            with tracer.start_as_current_span("spatial_branch"):
+                with torch.no_grad():
+                    spatial_score = spatial_branch(tensor).item()
+            t_spatial = time.perf_counter()
 
             # FFT branch — computed on face crop, not full frame
             face_gray = cv2.cvtColor(face_380, cv2.COLOR_RGB2GRAY)
-            freq_score = extract_frequency_score(face_gray)
+            with tracer.start_as_current_span("freq_branch"):
+                freq_score = extract_frequency_score(face_gray)
+            t_freq = time.perf_counter()
 
             deepfake_score = fuse(spatial_score, freq_score)
 
@@ -180,6 +237,18 @@ async def infer(payload: FramePayload):
         raise HTTPException(status_code=422, detail=f"Decode failure: {e}")
 
     latency_ms = int((time.time() - start_time) * 1000)
+
+    if PROFILE:
+        logger.info(
+            "PROFILE stream=%s frame=%d decode_ms=%.1f mtcnn_ms=%.1f spatial_ms=%.1f freq_ms=%.1f total_ms=%d",
+            payload.stream_id, payload.frame_index,
+            (t_decode - t_start) * 1000,
+            (t_mtcnn - t_decode) * 1000,
+            (t_spatial - t_mtcnn) * 1000,
+            (t_freq - t_spatial) * 1000,
+            latency_ms,
+        )
+
     return VisionResult(
         stream_id=payload.stream_id,
         frame_index=payload.frame_index,
@@ -203,4 +272,5 @@ async def health():
         "spatial_trained": spatial_branch_trained,
         "fft_mlp_trained": fft_mlp_trained,
         "fusion_trained": fusion_params is not None,
+        "calibration_trained": calibration_trained,
     }

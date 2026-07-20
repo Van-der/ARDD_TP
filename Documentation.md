@@ -975,3 +975,52 @@ Attempted migration to `langchain-faiss==0.1.1` (PyPI) — that package is an un
 ### Status
 
 Phase 2.5 pipeline and UI overhaul complete. Fused summaries flow end-to-end from RAG → aggregation → WebSocket → FlaggedFrames panel. Dashboard has bidirectional graph↔panel linking, stream selector, temporal window progress, light/dark mode, and a cleaned-up tooltip. 81/81 tests passing. Full 140/140 FF++ benchmark deferred to Phase 3 (gRPC throughput upgrade required).
+
+---
+
+## Session: 2026-07-11/12 — Phase 3-5 Completion (M0-M13) + Security/Docs Polish Pass
+
+Large multi-day push executing the Phase 3-5 completion plan (`/home/vander/.claude/plans/lets-try-to-finish-playful-barto.md`), grilled up front as a college-project-scoped 16-milestone plan (M0-M16), followed by a dedicated polish pass. This entry summarizes the whole arc; see `PLAN/PHASES.md` for full per-milestone detail and the plan file for exact verification transcripts.
+
+#### M0-M1 — Profiling & the gRPC decision
+
+Instrumented `vision-service`/`aggregation-service` with temporary timing spans (`PLAN/PROFILING.md`). Finding: REST/serialization overhead is only ~7-10ms (~7% of round trip) — the real bottleneck under real LLM inference is RAG's tinyllama call (~1s median). **gRPC migration evaluated and declined.** Scope redirected to decoupling RAG from the blocking per-frame path instead.
+
+#### M2-M7 — Performance & scalability
+
+- **M2:** `locustfile_multi.py` — multi-stream load harness with real JPEGs (fixed `locustfile.py`'s zero-byte `MOCK_PAYLOAD` bug that made every request 502).
+- **M3:** Kafka `frames` topic partitioned to 6; `key=stream_id` on all producers; rebalance listener + Redis-backed buffer in temporal-service (aiokafka has no true incremental-rebalance protocol, so this is a rebalance-event logger + safe-fallback buffer, not literal cooperative rebalancing — documented honestly as such).
+- **M4:** Redis-backed `alert_counters`/`drift_history` (aggregation-service) and stream buffer (temporal-service, atomic Lua push+flush), with in-memory fallback if Redis is unreachable.
+- **M5:** `aiobreaker` circuit breakers on `call_vision()`/`call_rag()`, fail-fast on open, state surfaced in `/health`.
+- **M6:** vision-service horizontal scaling as a mechanism demo — Traefik was tried but its bundled Docker client couldn't negotiate this environment's Docker Engine (29.4.0 / API 1.54); fell back to Compose's embedded DNS round-robin. No real throughput gain claimed (shared GPU).
+- **M7:** FAISS → persistent ChromaDB (`l2` distance pinned explicitly to preserve the existing similarity-score conversion). Real bug found: Chroma's metadata store rejects list values (unlike FAISS's in-memory dict) — `artefact_tags` now comma-joined/split at the read/write boundary.
+
+#### M8-M13 — Advanced analytics & hardening
+
+- **M8 (OTel):** Local `otel-collector` + Jaeger, no cloud APM. Two real bugs: `restart` vs `up -d` env-var staleness, and an `mlflow`/`opentelemetry-proto` protobuf version conflict (pinned aggregation-service to an older OTel release train).
+- **M9 (webhooks):** `WEBHOOK_TARGETS` JSON-array fan-out (generic + Slack formats) replacing the old single-target `WEBHOOK_URL`; local `webhook-receiver` stub as the demo target.
+- **M10 (mTLS):** Full mesh — CERT_REQUIRED on vision/rag/temporal, CERT_OPTIONAL on the browser-facing aggregation-service, Kafka SASL_SSL, WSS. Two real bugs: aggregation-service wasn't presenting its own client cert on outbound calls (`_client_cert()` fix), and the CA lacked RFC 5280 `keyUsage`/`basicConstraints` extensions (Python's `ssl` module rejected it; curl didn't care).
+- **M11 (RBAC):** Hardcoded admin/viewer role pairs baked into JWT claims; `require_role()` gates `POST /admin/reset_breaker`. Intentionally breaking: every old placeholder test credential stopped authenticating.
+- **M12 (MinIO archival):** One JPEG per alert-streak-start uploaded to local MinIO. Real bug: boto3's default connect timeout doesn't bound WSL's ~10s DNS-failure latency for unresolvable hostnames — fixed with an explicit short `botocore.config.Config`.
+- **M13 (calibration):** Isotonic regression fit on a no-retrain forward pass over the val split using already-deployed weights (deviated from the original "rerun training" decision after recognizing a fresh retrain would produce different, not better-calibrated, weights). Measured AUC 0.99780→0.99791, false-positive rate at the 0.90 threshold 0.29%→0.10%.
+
+M0-M13 were independently re-audited against the actual code on 2026-07-12 (not just re-reading old status claims) — all confirmed genuinely implemented; only doc drift found (see polish pass below), no missing functionality.
+
+#### Polish pass (2026-07-12): security hardening, connectivity fix, docker cache, docs sync
+
+Triggered by a direct request to verify M0-M13, close `PLAN/SECURITY.md`'s two remaining "deferred" gaps, fix frontend↔backend connectivity, keep Docker build-cache usage bounded, and resync stale docs.
+
+- **Real bug fixed:** `docker-compose.yml`'s `frontend` service read `VITE_CLIENT_ID`/`SECRET` from `CLIENT_ID`/`CLIENT_SECRET`, a var that doesn't exist anywhere in `.env`/`.env.example` — the frontend silently always logged in as viewer, with no working way to demo the RBAC-gated `AdminPanel`. Renamed to `FRONTEND_CLIENT_ID`/`FRONTEND_CLIENT_SECRET` (documented in `.env.example`; defaults to the viewer pair).
+- **SEC-3 closed:** `mlflow`'s host port `5000:5000` was removed (it was genuinely unauthenticated — MLflow OSS ignores `MLFLOW_TRACKING_TOKEN` — and `SECURITY.md` had been wrongly claiming it wasn't exposed). New `mlflow-proxy/` service (nginx + `openssl`-generated htpasswd at container start) now publishes 5000 with HTTP basic auth. Internal traffic (aggregation-service) still talks to `mlflow:5000` directly on the trusted bridge network.
+- **SEC-4 closed:** `aggregation-service/main.py` — access-token TTL cut from 3600s to 900s; added `POST /auth/refresh` (rotating refresh tokens, 24h TTL) and `POST /auth/revoke` (in-memory `revoked_jtis` set, checked by `require_role()` and the WebSocket handshake). Frontend's refresh timer switched from a full 55-minute re-login to an 800s refresh-token exchange. 5 new aggregation-service tests (49 total, was 44), all passing.
+- **Docker cache:** current usage checked (`docker system df`) — 42GB images, only 3.5GB reclaimable, 0B build cache; the earlier 108GB spike wasn't present at the time of this pass. Added `scripts/docker_cleanup.sh` (age-filtered `docker builder prune --filter until=24h` + dangling-image prune, non-destructive by default; `--aggressive` flag for a full prune) so it doesn't recur silently.
+- **Docs resynced:** `PLAN/ROADMAP.md`'s Phase 2.5 table (was still showing `⬜ Pending` for long-done items); stale FAISS references in `PLAN/ARCHITECTURE.md`/`ERROR_HANDLING.md`/`SCHEMA.md`/`TRD.md`/`REFERENCES.md` → ChromaDB; `PLAN/SECURITY.md` §2.3's false "MLflow not exposed" claim; `TaskTo.md`'s SEC-1..4 (all now resolved) and the now-moot D2 FAISS-import item (superseded by M7).
+
+### Status
+
+M0-M13 of the Phase 3-5 plan are complete and re-verified against actual code, not just prior claims. Both of `SECURITY.md`'s previously-deferred hardening items (MLflow auth proxy, JWT refresh/revocation) are now implemented. The frontend↔backend admin-login wiring bug is fixed. Docker cache usage is confirmed healthy with a cleanup script in place for future sessions. Remaining: M14 (atomic weight swap + rollback, mechanism demo), M15 (graph-based identity linking), M16 (windowing formalization).
+
+**Update (2026-07-20):**
+- `webhook-receiver` healthcheck bug fixed (added `curl` to Dockerfile). 
+- `temporal-service` test suite fixed by enforcing `REDIS_URL=""` to test the local buffer fallback correctly.
+- All 111 unit tests across all containers (Vision 20, Aggregation 49, RAG 13, Ingest 4, Temporal 20) verified passing natively inside their Docker environments.

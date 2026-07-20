@@ -6,6 +6,12 @@ import logging
 from typing import List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +25,17 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "tinyllama")
 MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
+PROFILE = os.getenv("PROFILE", "false").lower() == "true"
 START_TIME = time.time()
+
+# OpenTelemetry tracing (M8) — local Jaeger via otel-collector, no cloud APM.
+_otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+if _otel_endpoint:
+    _provider = TracerProvider(resource=Resource.create({"service.name": "rag-agent"}))
+    _provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=_otel_endpoint, insecure=True)))
+    trace.set_tracer_provider(_provider)
+    FastAPIInstrumentor.instrument_app(app)
+tracer = trace.get_tracer(__name__)
 
 # Predefined Threat Signatures from SCHEMA.md
 THREAT_SIGNATURES = [
@@ -58,12 +74,15 @@ THREAT_SIGNATURES = [
 vector_store = None
 vector_store_initialized = False
 
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "/data/chroma")
+
 def init_vector_store():
     global vector_store, vector_store_initialized
     try:
-        from langchain_community.vectorstores import FAISS
+        from langchain_community.vectorstores import Chroma
         from langchain_core.documents import Document
         from langchain_huggingface import HuggingFaceEmbeddings
+        from chromadb.config import Settings as ChromaSettings
 
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         documents = []
@@ -78,16 +97,29 @@ def init_vector_store():
                     "signature_id": sig["signature_id"],
                     "label": sig["label"],
                     "severity": sig["severity"],
-                    "artefact_tags": sig["artefact_tags"],
+                    # Chroma's metadata store only accepts scalar values (str/int/
+                    # float/bool) — unlike FAISS's in-memory dict, it can't hold a
+                    # raw list. Comma-joined here; split back to a list at the
+                    # read site (audit()) before passing to generate_verdict_via_llm.
+                    "artefact_tags": ",".join(sig["artefact_tags"]),
                 }
             )
             documents.append(doc)
-            
-        vector_store = FAISS.from_documents(documents, embeddings)
+
+        # hnsw:space="l2" must be pinned explicitly — Chroma's default distance
+        # metric for this embedding function would otherwise be cosine, which
+        # would silently break the existing `1.0 - (l2_dist / 2.0)` conversion
+        # and the >=0.75 match threshold in audit() below.
+        vector_store = Chroma.from_documents(
+            documents, embeddings,
+            persist_directory=CHROMA_PERSIST_DIR,
+            collection_metadata={"hnsw:space": "l2"},
+            client_settings=ChromaSettings(anonymized_telemetry=False),
+        )
         vector_store_initialized = True
-        logger.info("FAISS vector store successfully initialized with threat signatures.")
+        logger.info("Chroma vector store successfully initialized with threat signatures.")
     except Exception as e:
-        logger.error(f"Failed to initialize FAISS vector store: {e}")
+        logger.error(f"Failed to initialize Chroma vector store: {e}")
         vector_store_initialized = False
 
 # Try to initialize at import
@@ -114,7 +146,7 @@ async def verify_api_key(request: Request):
     return api_key
 
 def map_score_to_query(score: float) -> str:
-    """Map deepfake score to a semantic query to search FAISS."""
+    """Map deepfake score to a semantic query to search the vector store."""
     if score >= 0.8:
         return "high confidence deepfake face swap artifacts visible blending temporal flicker boundary blending"
     elif score >= 0.5:
@@ -199,12 +231,15 @@ async def audit(req: AuditRequest):
             
     # Search vector store using mapped score query
     query = map_score_to_query(req.deepfake_score)
+    t0 = time.perf_counter()
     try:
-        # Returns List[Tuple[Document, float]]
-        results = vector_store.similarity_search_with_score(query, k=1)
+        with tracer.start_as_current_span("vector_search"):
+            # Returns List[Tuple[Document, float]]
+            results = vector_store.similarity_search_with_score(query, k=1)
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
         raise HTTPException(status_code=503, detail="Vector store search failed")
+    t_search = time.perf_counter()
 
     verdict = "UNKNOWN"
     matched_sig = None
@@ -218,13 +253,23 @@ async def audit(req: AuditRequest):
 
         if similarity_score >= 0.75:
             matched_sig = doc.metadata["label"]
-            verdict, confidence, summary = await generate_verdict_via_llm(
-                req.deepfake_score,
-                doc.metadata["label"],
-                doc.page_content,
-                doc.metadata["severity"],
-                doc.metadata.get("artefact_tags"),
-            )
+            tags = doc.metadata.get("artefact_tags")
+            with tracer.start_as_current_span("generate_verdict_via_llm"):
+                verdict, confidence, summary = await generate_verdict_via_llm(
+                    req.deepfake_score,
+                    doc.metadata["label"],
+                    doc.page_content,
+                    doc.metadata["severity"],
+                    tags.split(",") if tags else None,
+                )
+
+    if PROFILE:
+        t_llm = time.perf_counter()
+        logger.info(
+            "PROFILE rag stream=%s frame=%s mock_llm=%s search_ms=%.1f llm_ms=%.1f",
+            req.stream_id, req.frame_index, MOCK_LLM,
+            (t_search - t0) * 1000, (t_llm - t_search) * 1000,
+        )
 
     return AuditResult(
         stream_id=req.stream_id,

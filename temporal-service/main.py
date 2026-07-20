@@ -1,12 +1,14 @@
 import os
+import ssl
 import time
 import base64
 import json
+import pickle
 import logging
 import asyncio
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -15,9 +17,12 @@ from PIL import Image
 import io
 
 import httpx
+import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 from aiokafka import AIOKafkaConsumer
+from aiokafka.abc import ConsumerRebalanceListener
+from aiokafka.coordinator.assignors.sticky.sticky_assignor import StickyPartitionAssignor
 
 from modeling import DeepFakeDetector
 
@@ -28,22 +33,42 @@ logger = logging.getLogger(__name__)
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "test-key")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC_FRAMES", "frames")
-KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
 KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
 KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
-AGGREGATION_URL = os.getenv("AGGREGATION_URL", "http://aggregation-service:8003")
+CA_CERT = os.getenv("CA_CERT", "/certs/ca.crt")
+AGGREGATION_URL = os.getenv("AGGREGATION_URL", "https://aggregation-service:8003")
+# mTLS (M10): aggregation-service is CERT_OPTIONAL, not CERT_REQUIRED, so this
+# isn't strictly required — presented anyway to match the full-mesh intent.
+CLIENT_CERT_FILE = os.getenv("CLIENT_CERT_FILE", "/certs/temporal-service.crt")
+CLIENT_KEY_FILE = os.getenv("CLIENT_KEY_FILE", "/certs/temporal-service.key")
+
+
+def _client_cert():
+    if os.path.exists(CLIENT_CERT_FILE) and os.path.exists(CLIENT_KEY_FILE):
+        return (CLIENT_CERT_FILE, CLIENT_KEY_FILE)
+    return None
 
 def _kafka_sasl_kwargs() -> dict:
-    return {
-        "security_protocol": "SASL_PLAINTEXT",
+    kwargs = {
+        "security_protocol": KAFKA_SECURITY_PROTOCOL,
         "sasl_mechanism": "PLAIN",
         "sasl_plain_username": KAFKA_SASL_USERNAME or "admin",
         "sasl_plain_password": KAFKA_SASL_PASSWORD or "admin-secret",
         "api_version": "auto",
     }
+    if kwargs["security_protocol"] == "SASL_SSL":
+        if os.path.exists(CA_CERT):
+            kwargs["ssl_context"] = ssl.create_default_context(cafile=CA_CERT)
+        else:
+            logger.warning(f"CA_CERT '{CA_CERT}' not found — falling back to SASL_PLAINTEXT")
+            kwargs["security_protocol"] = "SASL_PLAINTEXT"
+    return kwargs
 WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "/app/weights/model_87_acc_20_frames_final_data.pt")
 START_TIME = time.time()
 TARGET_FRAMES = 20
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_KEY_TTL_S = 300  # a partial window uncompleted for 5min indicates a dead stream
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -87,6 +112,101 @@ preprocess = transforms.Compose([
 # State
 stream_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=TARGET_FRAMES))
 
+# --- Redis-backed shared buffer, with process-local fallback ---
+# Makes the 20-frame tumbling window shared across multiple temporal-service
+# replicas (M3's --scale testing): whichever replica pushes the frame that
+# completes a window "wins" the flush atomically via the Lua script below, so
+# two replicas never double-run inference on the same window. If REDIS_URL is
+# unset, or Redis is unreachable, falls back to the process-local
+# `stream_buffers` deque exactly as before — Redis is never a hard dependency.
+# Known limitation: /health and /batch_status report `stream_buffers` sizes
+# only, so they under-report buffer fill levels while Redis is the active
+# backing store (observability gap, not a correctness issue).
+_redis: Optional["aioredis.Redis"] = None
+_redis_was_available = False
+
+# KEYS[1]=buffer key, ARGV[1]=pickled (frame_index, tensor) blob,
+# ARGV[2]=target frame count, ARGV[3]=TTL seconds.
+# Atomically pushes the frame and, only once the window is exactly full,
+# claims (reads + deletes) the whole buffer in the same round trip so no
+# other replica can also claim it.
+_FLUSH_AND_CLAIM_SCRIPT = """
+redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+local len = redis.call('LLEN', KEYS[1])
+if len >= tonumber(ARGV[2]) then
+    local items = redis.call('LRANGE', KEYS[1], 0, -1)
+    redis.call('DEL', KEYS[1])
+    return items
+else
+    return nil
+end
+"""
+
+async def _redis_client() -> Optional["aioredis.Redis"]:
+    global _redis, _redis_was_available
+    if not REDIS_URL:
+        return None
+    if _redis is None:
+        _redis = aioredis.from_url(
+            REDIS_URL, decode_responses=False,  # binary mode — buffer values are pickled tensors
+            socket_connect_timeout=1, socket_timeout=1,
+        )
+    try:
+        await _redis.ping()
+        _redis_was_available = True
+        return _redis
+    except Exception:
+        if _redis_was_available:
+            logger.warning("Redis unavailable — falling back to process-local stream buffers.")
+        _redis_was_available = False
+        return None
+
+async def _push_frame_and_maybe_flush(stream_id: str, frame_index: int, tensor: torch.Tensor) -> Optional[list]:
+    """Push a frame into the stream's window; returns the full list of
+    (frame_index, tensor) items if the window just completed (caller should
+    run inference), else None."""
+    r = await _redis_client()
+    if r is not None:
+        try:
+            key = f"temporal:buf:{stream_id}"
+            blob = pickle.dumps((frame_index, tensor))
+            raw = await r.eval(_FLUSH_AND_CLAIM_SCRIPT, 1, key, blob, TARGET_FRAMES, REDIS_KEY_TTL_S)
+            if raw is None:
+                return None
+            return [pickle.loads(item) for item in raw]
+        except Exception:
+            pass
+    buffer = stream_buffers[stream_id]
+    buffer.append((frame_index, tensor))
+    if len(buffer) == TARGET_FRAMES:
+        items = list(buffer)
+        buffer.clear()
+        return items
+    return None
+
+async def _pop_all_frames(stream_id: str) -> Optional[list]:
+    """Manual/early flush (POST /flush): pop whatever is currently buffered
+    for stream_id, partial or full. Returns None if the stream has never been
+    touched (flush is then a no-op, matching prior behavior)."""
+    r = await _redis_client()
+    if r is not None:
+        try:
+            key = f"temporal:buf:{stream_id}"
+            if not await r.exists(key):
+                return None
+            raw = await r.lrange(key, 0, -1)
+            await r.delete(key)
+            return [pickle.loads(item) for item in raw]
+        except Exception:
+            pass
+    if stream_id not in stream_buffers:
+        return None
+    buffer = stream_buffers[stream_id]
+    items = list(buffer)
+    buffer.clear()
+    return items
+
 class FlushRequest(BaseModel):
     stream_id: str
 
@@ -104,9 +224,9 @@ def process_frame(payload_b64: str) -> torch.Tensor:
 
 async def send_audit_result(payload: dict):
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=CA_CERT if os.path.exists(CA_CERT) else True, cert=_client_cert()) as client:
             resp = await client.post(
-                f"{AGGREGATION_URL}/temporal_audit", 
+                f"{AGGREGATION_URL}/temporal_audit",
                 json=payload, 
                 headers={"X-API-Key": INTERNAL_API_KEY}, 
                 timeout=5.0
@@ -115,11 +235,8 @@ async def send_audit_result(payload: dict):
     except Exception as e:
         logger.error(f"Failed to send audit result to aggregation: {e}")
 
-async def run_inference_and_flush(stream_id: str):
-    buffer = stream_buffers[stream_id]
-    n_frames = len(buffer)
-    items = list(buffer)
-    buffer.clear()
+async def run_inference_and_flush(stream_id: str, items: list):
+    n_frames = len(items)
 
     window_start = items[0][0] if items else 0
     window_end = items[-1][0] if items else 0
@@ -194,19 +311,43 @@ async def run_inference_and_flush(stream_id: str):
 
     await send_audit_result(payload)
 
+class RebalanceLogger(ConsumerRebalanceListener):
+    """Logs partition revoke/assign events during a consumer-group rebalance.
+
+    Note: aiokafka has no incremental/cooperative rebalance protocol (unlike
+    the Java client) — StickyPartitionAssignor minimizes partition churn
+    across rebalances, the best available mitigation here. Per-stream buffers
+    in `stream_buffers` are process-local, so a stream whose partition moves
+    to a different replica mid-window will under-fill; this fails safe via
+    the existing N<20 zero-pad / N<6 UNKNOWN fallback (see M4 for the
+    Redis-backed fix that removes this limitation).
+    """
+    def __init__(self, name: str):
+        self.name = name
+
+    async def on_partitions_revoked(self, revoked):
+        if revoked:
+            logger.warning(f"[{self.name}] Rebalance: partitions revoked: {sorted(revoked)}")
+
+    async def on_partitions_assigned(self, assigned):
+        if assigned:
+            logger.info(f"[{self.name}] Rebalance: partitions assigned: {sorted(assigned)}")
+
 async def frames_consumer_task():
     if os.getenv("TESTING"):
         return
     while True:
         try:
             consumer = AIOKafkaConsumer(
-                KAFKA_TOPIC,
                 bootstrap_servers=KAFKA_BOOTSTRAP,
                 group_id="temporal-service-group",
                 auto_offset_reset="latest",
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                partition_assignment_strategy=(StickyPartitionAssignor,),
                 **_kafka_sasl_kwargs()
             )
+            consumer.subscribe(topics=[KAFKA_TOPIC],
+                               listener=RebalanceLogger("temporal-service-group"))
             await consumer.start()
             logger.info("Temporal frames consumer started.")
             try:
@@ -219,9 +360,9 @@ async def frames_consumer_task():
                         continue
                     try:
                         tensor = process_frame(payload_b64)
-                        stream_buffers[stream_id].append((frame_index, tensor))
-                        if len(stream_buffers[stream_id]) == TARGET_FRAMES:
-                            await run_inference_and_flush(stream_id)
+                        items = await _push_frame_and_maybe_flush(stream_id, frame_index, tensor)
+                        if items is not None:
+                            await run_inference_and_flush(stream_id, items)
                     except Exception as e:
                         logger.error(f"Error processing frame for {stream_id}: {e}")
             finally:
@@ -245,6 +386,7 @@ async def batch_status():
 
 @app.post("/flush", dependencies=[Depends(verify_api_key)])
 async def flush_buffer(req: FlushRequest):
-    if req.stream_id in stream_buffers:
-        await run_inference_and_flush(req.stream_id)
+    items = await _pop_all_frames(req.stream_id)
+    if items is not None:
+        await run_inference_and_flush(req.stream_id, items)
     return {"status": "flushed", "stream_id": req.stream_id}

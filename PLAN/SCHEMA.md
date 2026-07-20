@@ -158,7 +158,7 @@ Published to the Kafka `labels` topic by an operator or auto-labelling service. 
 
 ## 8. Webhook Alert Payload
 
-POSTed by the Aggregation Service to `WEBHOOK_URL` when `alert: true` is set on an `AggregatedResult`.
+POSTed by the Aggregation Service to every target in `WEBHOOK_TARGETS` (a JSON array of `{"url","token","format"}` objects) when `alert: true` is set on an `AggregatedResult`. Targets are delivered to concurrently via `asyncio.gather`; one target failing does not block delivery to the others. `format: "generic"` (default) sends the payload below as-is; `format: "slack"` reshapes it into Slack's incoming-webhook `{"text": ...}` shape instead. The local `webhook-receiver` service (`GET /received` to inspect) is the default demo target.
 
 ```json
 {
@@ -173,23 +173,23 @@ POSTed by the Aggregation Service to `WEBHOOK_URL` when `alert: true` is set on 
 }
 ```
 
-**Headers sent with the request:**
+**Headers sent with the request (per-target `token`, if set):**
 ```
 Content-Type: application/json
-Authorization: Bearer <WEBHOOK_TOKEN>
+Authorization: Bearer <target token>
 ```
 
-> Delivery is retried up to 3 times with exponential backoff. Failed deliveries are logged as `webhook_delivery_failed` — see `ERROR_HANDLING.md §5`.
+> Delivery to each target is retried up to 3 times with exponential backoff. Failed deliveries are logged as `webhook_delivery_failed` — see `ERROR_HANDLING.md §5`.
 
 ---
 
 ## 9. Threat Signature Database
 
-The RAG Context Agent queries a vector store (FAISS/ChromaDB) backed by a structured threat signature registry. Each signature represents a known synthetic identity or deepfake artefact pattern.
+The RAG Context Agent queries a persistent ChromaDB vector store (M7 — replaced the original in-memory FAISS store) backed by a structured threat signature registry. Each signature represents a known synthetic identity or deepfake artefact pattern.
 
 ### 9.1 Threat Signature Record
 
-Stored in ChromaDB / FAISS as a document with metadata. The `embedding` is generated from `description` + `artefact_tags` at index time.
+Stored in ChromaDB as a document with metadata (`artefact_tags` comma-joined at write time and split back to a list on read — Chroma's metadata store only accepts scalar values, unlike FAISS's in-memory dict). The `embedding` is generated from `description` + `artefact_tags` at index time.
 
 ```json
 {

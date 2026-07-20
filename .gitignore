@@ -8,6 +8,9 @@ test_dataset/
 # MLflow data
 mlflow-data/
 
+# Local mTLS CA + generated certs/keys (M10) — regenerate via scripts/gen_certs.sh
+certs/
+
 # Python cache
 __pycache__/
 *.pyc

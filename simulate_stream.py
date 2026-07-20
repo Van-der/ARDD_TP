@@ -3,9 +3,12 @@ import time
 import json
 import base64
 import random
+from pathlib import Path
 import cv2
 import numpy as np
 from kafka import KafkaProducer
+
+_DEFAULT_CA_CERT = str(Path(__file__).parent / "certs" / "ca.crt")
 
 _MATPLOTLIB_FACE = os.path.expanduser(
     "~/.venvs/ardd-tp/lib/python3.13/site-packages/"
@@ -54,13 +57,16 @@ def main():
     print("Grace Hopper frames ready.")
     print("Connecting to Kafka...")
 
+    ca_cert = os.getenv("CA_CERT", _DEFAULT_CA_CERT)
+    ssl_kwargs = {"ssl_cafile": ca_cert} if os.path.exists(ca_cert) else {}
     producer = KafkaProducer(
         bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092"),
-        security_protocol="SASL_PLAINTEXT",
+        security_protocol="SASL_SSL" if ssl_kwargs else "SASL_PLAINTEXT",
         sasl_mechanism="PLAIN",
         sasl_plain_username="admin",
         sasl_plain_password="admin-secret",
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        **ssl_kwargs,
     )
 
     stream_id = "live_demo_stream"
@@ -85,7 +91,7 @@ def main():
                     "frame_index": frame_index,
                     "timestamp_ms": int(time.time() * 1000),
                     "payload": b64,
-                })
+                }, key=stream_id.encode("utf-8"))
                 print(f"[{frame_index:05d}] {label}")
                 frame_index += 1
                 time.sleep(0.15)
