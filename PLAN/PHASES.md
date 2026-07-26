@@ -2,7 +2,7 @@
 
 A step-by-step guide for building ARDD-TP in order. Each phase produces a runnable, testable system before the next begins.
 
-> **Current Status (2026-07-20):** Phase 1, Phase 2, and Phase 2.5 are complete. M0-M13 of the Phase 3-5 plan are implemented and verified (mTLS, MinIO, RBAC, Webhooks, OTel, Kafka SASL, etc). Pipeline bugs fixed, including `webhook-receiver` missing curl and `temporal-service` Redis testing fallback. 111/111 unit tests passing natively inside Docker. Remaining: M14 (atomic weight swap), M15 (graph-based linking), M16 (windowing formalization).
+> **Current Status (2026-07-24):** Phase 1, Phase 2, and Phase 2.5 are complete. M0-M13 of the Phase 3-5 plan are implemented and verified (mTLS, MinIO, RBAC, Webhooks, OTel, Kafka SASL, etc). Pipeline bugs fixed: `webhook-receiver` missing curl (PL-4), `temporal-service` Redis test isolation (PL-5), `ingest-gateway` gateway_fatal Kafka pollution (PL-6). 111/111 unit tests passing natively inside Docker. Full end-to-end run verified with `simulate_stream.py`. Remaining: M14 (atomic weight swap), M15 (graph-based linking), M16 (windowing formalization).
 
 ---
 

@@ -534,10 +534,16 @@ async def start_frames_consumer():
             try:
                 async for msg in consumer:
                     try:
-                        payload = FramePayload(**msg.value)
+                        data = msg.value
+                        # Skip control/error events from ingest-gateway
+                        # (e.g. gateway_fatal) — they are not FramePayloads
+                        if "event" in data and "payload" not in data:
+                            logger.debug(f"Skipping non-frame event: {data.get('event')}")
+                            continue
+                        payload = FramePayload(**data)
                         asyncio.create_task(_process_frame_locked(payload))
                     except Exception as e:
-                        logger.error(f"Pipeline error processing frame: {e}")
+                        logger.debug(f"Pipeline skipped malformed message: {e}")
             finally:
                 await consumer.stop()
         except Exception as e:

@@ -1021,6 +1021,10 @@ Triggered by a direct request to verify M0-M13, close `PLAN/SECURITY.md`'s two r
 M0-M13 of the Phase 3-5 plan are complete and re-verified against actual code, not just prior claims. Both of `SECURITY.md`'s previously-deferred hardening items (MLflow auth proxy, JWT refresh/revocation) are now implemented. The frontend↔backend admin-login wiring bug is fixed. Docker cache usage is confirmed healthy with a cleanup script in place for future sessions. Remaining: M14 (atomic weight swap + rollback, mechanism demo), M15 (graph-based identity linking), M16 (windowing formalization).
 
 **Update (2026-07-20):**
-- `webhook-receiver` healthcheck bug fixed (added `curl` to Dockerfile). 
+- `webhook-receiver` healthcheck bug fixed (added `curl` to Dockerfile).
 - `temporal-service` test suite fixed by enforcing `REDIS_URL=""` to test the local buffer fallback correctly.
 - All 111 unit tests across all containers (Vision 20, Aggregation 49, RAG 13, Ingest 4, Temporal 20) verified passing natively inside their Docker environments.
+
+**Update (2026-07-24):**
+- **PL-6 fixed:** `ingest-gateway` publishes a `gateway_fatal` event to the Kafka `frames` topic when `RTSP_SOURCE` is unset and retries are exhausted. `aggregation-service`'s Kafka consumer was trying to parse that control event as a `FramePayload`, generating repeated `ValidationError` log spam and silently dropping consumer loop iterations. Fixed in `aggregation-service/main.py`: messages with an `"event"` key but no `"payload"` key are now skipped at `DEBUG` level before `FramePayload` validation — making the consumer robust to any future gateway status events on the same topic.
+- Full end-to-end run verified with `simulate_stream.py`: frames flow Kafka → aggregation-service → vision-service → rag-agent → WebSocket → React dashboard live; MLflow session run populates with per-frame metrics; webhook-receiver receives `DEEPFAKE_ALERT` payloads on alert streaks.
